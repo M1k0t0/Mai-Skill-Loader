@@ -30,9 +30,15 @@
       "type": "python_package",
       "name": "pypdf",
       "version_spec": ">=5.0.0"
+    },
+    {
+      "type": "python_package",
+      "name": "PyYAML",
+      "version_spec": ">=6.0.0"
     }
   ],
   "capabilities": [
+    "send.text",
     "llm.generate",
     "llm.generate_with_tools",
     "llm.get_available_models",

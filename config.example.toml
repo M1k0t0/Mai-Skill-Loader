@@ -5,7 +5,6 @@
 enabled = true
 config_version = "1.0.0"
 
-[skill_loader]
 skills_dir = "skills"
 default_model = ""           # 留空使用系统默认模型，填写 model_config.toml 中的模型 name
 default_max_turns = 10       # agent 模式默认最大轮数
@@ -43,6 +42,6 @@ bash_blocked_commands = [
     "kill -9 1", "killall",
 ]
 
-read_allowed_dirs = []       # 读取目录白名单（空=不限）
-write_allowed_dirs = []      # 写入目录白名单（空=不限）
+read_allowed_dirs = []       # 读取目录白名单（空=默认仅限插件目录）
+write_allowed_dirs = []      # 写入目录白名单（空=默认仅限插件 data/ 目录）
 write_max_size_kb = 1024     # 写入文件最大 KB

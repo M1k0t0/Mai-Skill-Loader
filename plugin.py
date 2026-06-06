@@ -11,22 +11,20 @@
 - /skill enable|disable 运行时开关
 """
 
-from typing import Any, Dict, List, Optional
 from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 import asyncio
 import importlib.util
 import json
 import logging
 import re
-import sys
 import time
 import traceback
 
 import yaml
 
-from maibot_sdk import Command, Field, MaiBotPlugin, PluginConfigBase
-from maibot_sdk.types import ToolParameterInfo, ToolParamType
+from maibot_sdk import Field, MaiBotPlugin, PluginConfigBase
 
 logger = logging.getLogger("skill_loader")
 
@@ -59,8 +57,14 @@ class CapabilitiesConfig(PluginConfigBase):
         ],
         description="禁止的命令模式",
     )
-    read_allowed_dirs: List[str] = Field(default_factory=list, description="读取目录白名单（空=不限）")
-    write_allowed_dirs: List[str] = Field(default_factory=list, description="写入目录白名单（空=不限）")
+    read_allowed_dirs: List[str] = Field(
+        default_factory=list,
+        description="读取目录白名单（空=默认仅限插件目录）",
+    )
+    write_allowed_dirs: List[str] = Field(
+        default_factory=list,
+        description="写入目录白名单（空=默认仅限插件 data/ 目录）",
+    )
     write_max_size_kb: int = Field(default=1024, description="写入文件最大 KB")
     bash_require_approval: bool = Field(default=True, description="bash 命令是否需要管理员审批")
     bash_approval_timeout: int = Field(default=120, description="审批等待超时（秒）")
@@ -233,7 +237,12 @@ def parse_skill(skill_path: Path) -> Optional[SkillDefinition]:
     if mode not in ("direct", "agent"):
         mode = "agent"
     model = str(metadata.get("maibot-model", "")).strip()
-    max_turns = int(metadata.get("maibot-max-turns", 10))
+    max_turns_raw = metadata.get("maibot-max-turns", 10)
+    try:
+        max_turns = int(max_turns_raw)
+    except (TypeError, ValueError):
+        logger.warning(f"Skill '{name}' maibot-max-turns 无效: {max_turns_raw!r}，使用默认 10")
+        max_turns = 10
 
     # 是否默认启用（maibot-enabled: false 则跳过）
     enabled = str(metadata.get("maibot-enabled", "true")).strip().lower()
@@ -263,6 +272,15 @@ def parse_skill(skill_path: Path) -> Optional[SkillDefinition]:
     )
 
 
+def _try_parse_skill(skill_path: Path) -> Optional[SkillDefinition]:
+    """解析 skill 目录，失败时记录日志并返回 None。"""
+    try:
+        return parse_skill(skill_path)
+    except Exception as exc:
+        logger.warning(f"解析 skill 失败 ({skill_path.name}): {exc}")
+        return None
+
+
 def scan_skills(skills_dir: Path) -> Dict[str, SkillDefinition]:
     """扫描目录返回 {name: SkillDefinition}。
     
@@ -279,7 +297,7 @@ def scan_skills(skills_dir: Path) -> Dict[str, SkillDefinition]:
     for item in sorted(skills_dir.iterdir()):
         if not item.is_dir() or item.name.startswith(("_", ".")):
             continue
-        skill = parse_skill(item)
+        skill = _try_parse_skill(item)
         if skill:
             result[skill.name] = skill
 
@@ -289,22 +307,23 @@ def scan_skills(skills_dir: Path) -> Dict[str, SkillDefinition]:
         for item in sorted(agents_skills_dir.iterdir()):
             if not item.is_dir() or item.name.startswith(("_", ".")):
                 continue
-            skill = parse_skill(item)
+            skill = _try_parse_skill(item)
             if skill and skill.name not in result:
                 result[skill.name] = skill
 
     # 扫描项目根目录的 .agents/skills/（npx skills add 在项目根执行时的安装位置）
     # 从 skills_dir 向上找到包含 bot.py 或 pyproject.toml 的目录
-    project_root = skills_dir.parent.parent  # plugins/skill_loader/skills → plugins/skill_loader → plugins → project_root
-    # 再上一级到真正的项目根
-    if not (project_root / "bot.py").exists():
-        project_root = project_root.parent
+    project_root = skills_dir
+    for candidate in [skills_dir, *skills_dir.parents]:
+        if (candidate / "bot.py").exists() or (candidate / "pyproject.toml").exists():
+            project_root = candidate
+            break
     root_agents_dir = project_root / ".agents" / "skills"
     if root_agents_dir.exists() and root_agents_dir != agents_skills_dir:
         for item in sorted(root_agents_dir.iterdir()):
             if not item.is_dir() or item.name.startswith(("_", ".")):
                 continue
-            skill = parse_skill(item)
+            skill = _try_parse_skill(item)
             if skill and skill.name not in result:
                 result[skill.name] = skill
 
@@ -328,33 +347,159 @@ def get_allowed_caps(skill: SkillDefinition, cap_cfg: CapabilitiesConfig) -> Lis
     return [c for c in skill.capabilities if perm.get(c, False)]
 
 
-async def run_capability(name: str, args: Dict[str, Any], cfg: CapabilitiesConfig,
-                        ctx: Any = None, stream_id: str = "") -> str:
+def _resolve_read_roots(
+    cfg_dirs: List[str],
+    plugin_dir: Optional[Path],
+    extra_roots: Optional[List[Path]] = None,
+) -> List[Path]:
+    """解析读取目录白名单；未配置时默认插件目录 + 当前 skill 等资源目录。"""
+    if cfg_dirs:
+        return [Path(d).resolve() for d in cfg_dirs]
+
+    roots: List[Path] = []
+    seen: set[str] = set()
+    for candidate in [plugin_dir, *(extra_roots or [])]:
+        if candidate is None:
+            continue
+        resolved = candidate.resolve()
+        key = str(resolved)
+        if key in seen:
+            continue
+        seen.add(key)
+        roots.append(resolved)
+    return roots
+
+
+def _coerce_max_lines(raw: Any, default: int = 200) -> int:
+    """将 read.max_lines 参数安全转换为正整数。"""
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _resolve_write_roots(cfg_dirs: List[str], plugin_dir: Optional[Path]) -> List[Path]:
+    """解析写入目录白名单；未配置时默认仅限插件 data/ 目录。"""
+    if cfg_dirs:
+        return [Path(d).resolve() for d in cfg_dirs]
+    if plugin_dir is None:
+        return []
+    data_dir = (plugin_dir / "data").resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return [data_dir]
+
+
+def _is_path_allowed(fp: Path, allowed_roots: List[Path]) -> bool:
+    """检查路径是否在白名单根目录下。"""
+    if not allowed_roots:
+        return False
+    return any(fp == root or root in fp.parents for root in allowed_roots)
+
+
+async def run_capability(
+    name: str,
+    args: Dict[str, Any],
+    cfg: CapabilitiesConfig,
+    ctx: Any = None,
+    stream_id: str = "",
+    plugin_dir: Optional[Path] = None,
+    read_extra_roots: Optional[List[Path]] = None,
+) -> str:
     """执行单个 capability tool。"""
     if name == "bash":
-        return await _cap_bash(args.get("command", ""), cfg, ctx=ctx, stream_id=stream_id)
+        return await _cap_bash(args.get("command", ""), cfg, ctx=ctx, stream_id=stream_id, plugin_dir=plugin_dir)
     elif name == "read":
-        return await _cap_read_file(args.get("path", ""), cfg, int(args.get("max_lines", 200)),
-                                    ctx=ctx, stream_id=stream_id)
+        return await _cap_read_file(
+            args.get("path", ""),
+            cfg,
+            _coerce_max_lines(args.get("max_lines", 200)),
+            plugin_dir=plugin_dir,
+            read_extra_roots=read_extra_roots,
+        )
     elif name == "write":
-        return await _cap_write_file(args.get("path", ""), args.get("content", ""), cfg)
+        return await _cap_write_file(args.get("path", ""), args.get("content", ""), cfg, plugin_dir=plugin_dir)
     elif name == "edit":
-        return await _cap_edit_file(args.get("path", ""), args.get("old_str", ""), args.get("new_str", ""), cfg)
+        return await _cap_edit_file(
+            args.get("path", ""),
+            args.get("old_str", ""),
+            args.get("new_str", ""),
+            cfg,
+            plugin_dir=plugin_dir,
+        )
     return f"未知 capability: {name}"
 
 
-def _is_admin(user_id: str, admin_ids: List[str]) -> bool:
+def _is_admin(user_id: str, admin_ids: List[str], platform: str = "") -> bool:
     """检查用户是否为管理员。支持 'platform:id' 和纯数字格式。"""
+    normalized_user_id = str(user_id or "").strip()
+    normalized_platform = str(platform or "").strip()
+    if not normalized_user_id:
+        return False
+
     for admin in admin_ids:
-        if ":" in admin:
-            # 格式: qq:123456
-            if user_id == admin.split(":", 1)[1]:
+        admin_entry = str(admin or "").strip()
+        if not admin_entry:
+            continue
+        if ":" in admin_entry:
+            # 格式: qq:123456，必须平台与用户 ID 同时匹配
+            admin_platform, admin_user_id = admin_entry.split(":", 1)
+            admin_platform = admin_platform.strip()
+            admin_user_id = admin_user_id.strip()
+            if not normalized_platform or admin_platform != normalized_platform:
+                continue
+            if normalized_user_id == admin_user_id:
                 return True
-        else:
-            # 纯数字 QQ 号
-            if user_id == admin:
-                return True
+        elif normalized_user_id == admin_entry:
+            return True
     return False
+
+
+def _extract_message_timestamp(msg: Any) -> float:
+    """从 get_recent 返回的消息中提取 Unix 时间戳。"""
+    if not isinstance(msg, dict):
+        return 0.0
+    try:
+        return float(msg.get("timestamp", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_message_user_id(msg: Any) -> str:
+    """从 get_recent 返回的消息中提取发送者 user_id。"""
+    if not isinstance(msg, dict):
+        return ""
+    top_level = str(msg.get("user_id") or "").strip()
+    if top_level:
+        return top_level
+    message_info = msg.get("message_info")
+    if isinstance(message_info, dict):
+        user_info = message_info.get("user_info")
+        if isinstance(user_info, dict):
+            return str(user_info.get("user_id") or "").strip()
+    return ""
+
+
+def _extract_message_text(msg: Any) -> str:
+    """从 get_recent 返回的消息中提取纯文本内容。"""
+    if not isinstance(msg, dict):
+        return ""
+    top_content = str(msg.get("content") or "").strip()
+    if top_content:
+        return top_content
+    raw_message = msg.get("raw_message")
+    if not isinstance(raw_message, list):
+        return ""
+    parts: List[str] = []
+    for segment in raw_message:
+        if not isinstance(segment, dict) or segment.get("type") != "text":
+            continue
+        data = segment.get("data")
+        if isinstance(data, str):
+            parts.append(data)
+        elif data is not None:
+            parts.append(str(data))
+    return "".join(parts).strip()
 
 
 async def _wait_admin_approval(command: str, cfg: CapabilitiesConfig, ctx: Any, stream_id: str) -> bool:
@@ -384,13 +529,14 @@ async def _wait_admin_approval(command: str, cfg: CapabilitiesConfig, ctx: Any, 
                 continue
             for msg in recent:
                 # 检查是否是审批请求之后的消息
-                msg_time = msg.get("timestamp", 0)
+                msg_time = _extract_message_timestamp(msg)
                 if msg_time < start_time:
                     continue
-                sender_id = str(msg.get("user_id", ""))
-                if not _is_admin(sender_id, cfg.admin_ids):
+                sender_id = _extract_message_user_id(msg)
+                sender_platform = str(msg.get("platform") or "").strip()
+                if not _is_admin(sender_id, cfg.admin_ids, sender_platform):
                     continue
-                content = str(msg.get("content", "")).strip().upper()
+                content = _extract_message_text(msg).strip().upper()
                 if content in ("Y", "YES", "是", "同意"):
                     await ctx.send.text("[审批通过] 正在执行命令...", stream_id)
                     return True
@@ -402,7 +548,8 @@ async def _wait_admin_approval(command: str, cfg: CapabilitiesConfig, ctx: Any, 
     return False  # 超时自动拒绝
 
 
-async def _cap_bash(command: str, cfg: CapabilitiesConfig, ctx: Any = None, stream_id: str = "") -> str:
+async def _cap_bash(command: str, cfg: CapabilitiesConfig, ctx: Any = None, stream_id: str = "",
+                    plugin_dir: Optional[Path] = None) -> str:
     # 高危命令直接拒绝
     for blocked in cfg.bash_blocked_commands:
         if blocked in command:
@@ -415,9 +562,15 @@ async def _cap_bash(command: str, cfg: CapabilitiesConfig, ctx: Any = None, stre
             return "管理员拒绝执行该命令，或审批超时。"
 
     try:
+        if cfg.bash_working_dir:
+            working_dir = cfg.bash_working_dir
+        elif plugin_dir:
+            working_dir = str(plugin_dir)
+        else:
+            working_dir = None
         proc = await asyncio.create_subprocess_shell(
             command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd=cfg.bash_working_dir or None,
+            cwd=working_dir,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=cfg.bash_timeout)
         out = stdout.decode("utf-8", errors="replace")[:20000]
@@ -435,88 +588,29 @@ async def _cap_bash(command: str, cfg: CapabilitiesConfig, ctx: Any = None, stre
         return f"执行失败: {e}"
 
 
-async def _ensure_dependency(package_name: str, pip_name: str, cfg: CapabilitiesConfig,
-                             ctx: Any = None, stream_id: str = "") -> Optional[str]:
-    """尝试导入依赖，失败时走审批安装流程。返回 None 表示成功，返回错误字符串表示失败。"""
+async def _require_dependency(package_name: str, pip_name: str) -> Optional[str]:
+    """检查依赖是否已安装，缺失时返回错误信息。"""
     try:
         __import__(package_name)
         return None
     except ImportError:
-        pass
-
-    # 走审批流程安装
-    if not ctx or not stream_id or not cfg.admin_ids:
-        return f"缺少 {pip_name} 依赖，且无法请求管理员审批安装"
-
-    install_msg = (
-        f"[Skill Loader 依赖安装审批]\n"
-        f"读取文件需要安装依赖: {pip_name}\n"
-        f"管理员请回复 Y 同意安装 / N 拒绝（{cfg.bash_approval_timeout}秒超时自动拒绝）"
-    )
-    await ctx.send.text(install_msg, stream_id)
-
-    # 复用审批等待逻辑
-    start_time = time.time()
-    approved = False
-    while time.time() - start_time < cfg.bash_approval_timeout:
-        await asyncio.sleep(2)
-        try:
-            recent = await ctx.message.get_recent(stream_id, limit=10)
-            if not recent:
-                continue
-            for msg in recent:
-                msg_time = msg.get("timestamp", 0)
-                if msg_time < start_time:
-                    continue
-                sender_id = str(msg.get("user_id", ""))
-                if not _is_admin(sender_id, cfg.admin_ids):
-                    continue
-                content = str(msg.get("content", "")).strip().upper()
-                if content in ("Y", "YES", "是", "同意"):
-                    approved = True
-                    break
-                if content in ("N", "NO", "否", "拒绝"):
-                    return f"管理员拒绝安装 {pip_name}"
-            if approved:
-                break
-        except Exception:
-            continue
-
-    if not approved:
-        return f"安装 {pip_name} 审批超时"
-
-    # 执行安装
-    await ctx.send.text(f"[审批通过] 正在安装 {pip_name}...", stream_id)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "pip", "install", pip_name,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
-        if proc.returncode != 0:
-            err = stderr.decode("utf-8", errors="replace")[:2000]
-            return f"安装 {pip_name} 失败: {err}"
-    except asyncio.TimeoutError:
-        return f"安装 {pip_name} 超时"
-
-    # 验证安装成功
-    try:
-        __import__(package_name)
-        await ctx.send.text(f"[已安装] {pip_name} 安装成功", stream_id)
-        return None
-    except ImportError:
-        return f"安装 {pip_name} 后仍无法导入"
+        return f"缺少 {pip_name} 依赖，请在插件 manifest 中声明并由依赖流水线安装"
 
 
-async def _cap_read_file(path: str, cfg: CapabilitiesConfig, max_lines: int = 200,
-                         ctx: Any = None, stream_id: str = "") -> str:
-    fp = Path(path).resolve()
-    if cfg.read_allowed_dirs:
-        allowed_roots = [Path(d).resolve() for d in cfg.read_allowed_dirs]
-        if not any(fp == root or root in fp.parents for root in allowed_roots):
-            return f"安全策略阻止: {path} 不在白名单目录中"
-    if fp.is_symlink():
-        return f"安全策略阻止: 不允许读取符号链接"
+async def _cap_read_file(
+    path: str,
+    cfg: CapabilitiesConfig,
+    max_lines: int = 200,
+    plugin_dir: Optional[Path] = None,
+    read_extra_roots: Optional[List[Path]] = None,
+) -> str:
+    raw_fp = Path(path)
+    if raw_fp.is_symlink():
+        return "安全策略阻止: 不允许读取符号链接"
+    fp = raw_fp.resolve()
+    allowed_roots = _resolve_read_roots(cfg.read_allowed_dirs, plugin_dir, read_extra_roots)
+    if not _is_path_allowed(fp, allowed_roots):
+        return f"安全策略阻止: {path} 不在白名单目录中"
     if not fp.exists():
         return f"文件不存在: {path}"
 
@@ -524,7 +618,7 @@ async def _cap_read_file(path: str, cfg: CapabilitiesConfig, max_lines: int = 20
     try:
         # docx 文件
         if suffix == ".docx":
-            err = await _ensure_dependency("docx", "python-docx", cfg, ctx, stream_id)
+            err = await _require_dependency("docx", "python-docx")
             if err:
                 return err
             from docx import Document
@@ -536,7 +630,7 @@ async def _cap_read_file(path: str, cfg: CapabilitiesConfig, max_lines: int = 20
 
         # pdf 文件
         if suffix == ".pdf":
-            err = await _ensure_dependency("pypdf", "pypdf", cfg, ctx, stream_id)
+            err = await _require_dependency("pypdf", "pypdf")
             if err:
                 return err
             from pypdf import PdfReader
@@ -559,12 +653,15 @@ async def _cap_read_file(path: str, cfg: CapabilitiesConfig, max_lines: int = 20
         return f"读取失败: {e}"
 
 
-async def _cap_write_file(path: str, content: str, cfg: CapabilitiesConfig) -> str:
-    fp = Path(path).resolve()
-    if cfg.write_allowed_dirs:
-        allowed_roots = [Path(d).resolve() for d in cfg.write_allowed_dirs]
-        if not any(fp == root or root in fp.parents for root in allowed_roots):
-            return f"安全策略阻止: {path} 不在白名单目录中"
+async def _cap_write_file(path: str, content: str, cfg: CapabilitiesConfig,
+                          plugin_dir: Optional[Path] = None) -> str:
+    raw_fp = Path(path)
+    if raw_fp.exists() and raw_fp.is_symlink():
+        return "安全策略阻止: 不允许写入符号链接"
+    fp = raw_fp.resolve()
+    allowed_roots = _resolve_write_roots(cfg.write_allowed_dirs, plugin_dir)
+    if not _is_path_allowed(fp, allowed_roots):
+        return f"安全策略阻止: {path} 不在白名单目录中"
     if len(content.encode()) > cfg.write_max_size_kb * 1024:
         return f"内容超过 {cfg.write_max_size_kb}KB 限制"
     try:
@@ -575,13 +672,16 @@ async def _cap_write_file(path: str, content: str, cfg: CapabilitiesConfig) -> s
         return f"写入失败: {e}"
 
 
-async def _cap_edit_file(path: str, old_str: str, new_str: str, cfg: CapabilitiesConfig) -> str:
+async def _cap_edit_file(path: str, old_str: str, new_str: str, cfg: CapabilitiesConfig,
+                         plugin_dir: Optional[Path] = None) -> str:
     """查找替换文件内容。"""
-    fp = Path(path).resolve()
-    if cfg.write_allowed_dirs:
-        allowed_roots = [Path(d).resolve() for d in cfg.write_allowed_dirs]
-        if not any(fp == root or root in fp.parents for root in allowed_roots):
-            return f"安全策略阻止: {path} 不在白名单目录中"
+    raw_fp = Path(path)
+    if raw_fp.is_symlink():
+        return "安全策略阻止: 不允许编辑符号链接"
+    fp = raw_fp.resolve()
+    allowed_roots = _resolve_write_roots(cfg.write_allowed_dirs, plugin_dir)
+    if not _is_path_allowed(fp, allowed_roots):
+        return f"安全策略阻止: {path} 不在白名单目录中"
     if not fp.exists():
         return f"文件不存在: {path}"
     if not fp.is_file():
@@ -591,7 +691,7 @@ async def _cap_edit_file(path: str, old_str: str, new_str: str, cfg: Capabilitie
     try:
         content = fp.read_text(encoding="utf-8", errors="replace")
         if old_str not in content:
-            return f"未找到要替换的内容"
+            return "未找到要替换的内容"
         count = content.count(old_str)
         new_content = content.replace(old_str, new_str)
         fp.write_text(new_content, encoding="utf-8")
@@ -627,9 +727,14 @@ class SessionStore:
     def save(self, stream_id: str, skill_name: str, messages: List[Dict[str, Any]], max_history: int) -> None:
         """保存会话 messages，截断超出的旧轮。"""
         key = self._key(stream_id, skill_name)
-        # 保留 system message + 最近 max_history 条非 system 消息
+        # 只保留可独立回放的对话消息。工具调用链如果被截断，OpenAI 兼容接口会因为
+        # assistant.tool_calls 与 tool 消息不成对而拒绝请求。
         system_msgs = [m for m in messages if m.get("role") == "system"]
-        other_msgs = [m for m in messages if m.get("role") != "system"]
+        other_msgs = [
+            m
+            for m in messages
+            if m.get("role") in {"user", "assistant"} and not m.get("tool_calls")
+        ]
         if len(other_msgs) > max_history:
             other_msgs = other_msgs[-max_history:]
         self._sessions[key] = {
@@ -653,8 +758,60 @@ class SessionStore:
 # 全局会话存储实例
 _session_store = SessionStore()
 
+# 脚本模块缓存（key: 绝对路径）
+_script_modules: Dict[str, Any] = {}
 
-# ====== Agent Loop ======
+
+def _clear_script_cache() -> None:
+    """清除脚本模块缓存，reload 后重新加载。"""
+    _script_modules.clear()
+
+
+def _load_script_module(script_path: Path) -> Optional[Any]:
+    """加载并缓存 skill 脚本模块。"""
+    cache_key = str(script_path.resolve())
+    cached = _script_modules.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        module_name = f"skill_script_{script_path.stem}_{abs(hash(cache_key))}"
+        spec = importlib.util.spec_from_file_location(module_name, script_path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _script_modules[cache_key] = module
+        return module
+    except Exception as e:
+        logger.warning(f"加载脚本失败 {script_path}: {e}")
+        return None
+
+
+def _load_script_fn(script_path: Path) -> Optional[Any]:
+    """加载脚本的 run 函数。"""
+    module = _load_script_module(script_path)
+    if module is None:
+        return None
+    return getattr(module, "run", None)
+
+
+def _build_script_tools(skill: SkillDefinition) -> List[Dict[str, Any]]:
+    """从 scripts 构建 tool schema。"""
+    tools = []
+    for name, path in skill.scripts.items():
+        module = _load_script_module(path)
+        if module is None:
+            continue
+        schema = getattr(module, "TOOL_SCHEMA", None)
+        if isinstance(schema, dict):
+            tools.append(schema)
+        elif hasattr(module, "run"):
+            tools.append({"type": "function", "function": {
+                "name": name,
+                "description": (getattr(module, "__doc__", None) or f"执行 {name}").strip(),
+                "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "输入"}}}
+            }})
+    return tools
 
 
 def _estimate_tokens(text: str) -> int:
@@ -686,53 +843,22 @@ def _truncate_messages(messages: List[Dict[str, Any]], max_tokens: int) -> List[
     return system_msgs + kept
 
 
-def _load_script_fn(script_path: Path) -> Optional[Any]:
-    """加载脚本的 run 函数。"""
-    try:
-        spec = importlib.util.spec_from_file_location(f"skill_script_{script_path.stem}", script_path)
-        if spec is None or spec.loader is None:
-            return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return getattr(module, "run", None)
-    except Exception as e:
-        logger.warning(f"加载脚本失败 {script_path}: {e}")
-        return None
-
-
-def _build_script_tools(skill: SkillDefinition) -> List[Dict[str, Any]]:
-    """从 scripts 构建 tool schema。"""
-    tools = []
-    for name, path in skill.scripts.items():
-        try:
-            spec = importlib.util.spec_from_file_location(name, path)
-            if spec is None or spec.loader is None:
-                continue
-            module = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(module)
-            schema = getattr(module, "TOOL_SCHEMA", None)
-            if isinstance(schema, dict):
-                tools.append(schema)
-            elif hasattr(module, "run"):
-                tools.append({"type": "function", "function": {
-                    "name": name,
-                    "description": (getattr(module, "__doc__", None) or f"执行 {name}").strip(),
-                    "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "输入"}}}
-                }})
-        except Exception:
-            pass
-    return tools
+# ====== Agent Loop ======
 
 
 async def run_agent_loop(
     skill: SkillDefinition, task: str, ctx: Any, config: SkillLoaderConfig,
-    chat_context: str = "", stream_id: str = "",
+    chat_context: str = "", stream_id: str = "", plugin_dir: Optional[Path] = None,
+    skills_dir: Optional[Path] = None,
 ) -> str:
     """执行 agent 模式 skill。"""
     model = skill.model or config.default_model
     max_turns = skill.max_turns or config.default_max_turns
     max_tokens = config.agent_max_context_tokens
     cap_cfg = config.capabilities
+    read_extra_roots: List[Path] = [skill.skill_path]
+    if skills_dir is not None:
+        read_extra_roots.append(skills_dir)
 
     # 构建 tools = scripts + allowed capabilities
     tools = _build_script_tools(skill)
@@ -842,7 +968,15 @@ async def run_agent_loop(
 
             # 分发：capability 还是 script
             if fn_name in cap_names:
-                tool_result = await run_capability(fn_name, fn_args, cap_cfg, ctx=ctx, stream_id=stream_id)
+                tool_result = await run_capability(
+                    fn_name,
+                    fn_args,
+                    cap_cfg,
+                    ctx=ctx,
+                    stream_id=stream_id,
+                    plugin_dir=plugin_dir,
+                    read_extra_roots=read_extra_roots,
+                )
             elif fn_name in script_fns:
                 try:
                     fn = script_fns[fn_name]
@@ -944,6 +1078,13 @@ class TaskManager:
         pass  # v2 暂不实现 TTL，结果取走即删
 
 
+def _build_task_key(stream_id: str, skill_name: str) -> str:
+    """构造后台任务 key，避免不同聊天流的同名 skill 串结果。"""
+
+    normalized_stream_id = str(stream_id or "global").strip() or "global"
+    return f"{normalized_stream_id}:{skill_name}"
+
+
 # ====== 插件主类 ======
 
 
@@ -956,7 +1097,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
         super().__init__()
         self._skills: Dict[str, SkillDefinition] = {}
         self._task_mgr = TaskManager()
-        self._load_skills()
+        self._last_loaded_skills_dir = ""
 
     @property
     def config(self) -> SkillLoaderConfig:
@@ -965,21 +1106,40 @@ class SkillLoaderPlugin(MaiBotPlugin):
     def _load_skills(self) -> None:
         """扫描并加载 skills。"""
         plugin_dir = Path(__file__).parent
-        skills_dir = plugin_dir / self.config.skills_dir
+        configured_skills_dir = Path(self.config.skills_dir)
+        skills_dir = configured_skills_dir if configured_skills_dir.is_absolute() else plugin_dir / configured_skills_dir
         self._skills = scan_skills(skills_dir)
+        self._last_loaded_skills_dir = str(skills_dir)
+        _clear_script_cache()
         if self._skills:
             logger.info(f"Skill Loader: 加载了 {len(self._skills)} 个 skill: {list(self._skills.keys())}")
         else:
             logger.warning(f"Skill Loader: 未找到任何 skill (目录: {skills_dir})")
 
+    def set_plugin_config(self, config: Dict[str, Any]) -> None:
+        """注入配置后按最新 skills_dir 扫描 skill。"""
+
+        super().set_plugin_config(config)
+        self._load_skills()
+
     def get_components(self) -> List[Dict[str, Any]]:
         """覆写：返回动态 skill tools + 静态 /skill command。"""
+        if not self._last_loaded_skills_dir:
+            self._load_skills()
+
         components = []
 
         # 动态 skill tools
         for skill in self._skills.values():
-            params: Dict[str, Any] = {
-                "task": {"type": "string", "description": f"要 {skill.name} 执行的任务描述", "required": True}
+            params_schema: Dict[str, Any] = {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": f"要 {skill.name} 执行的任务描述",
+                    }
+                },
+                "required": ["task"],
             }
             components.append({
                 "name": skill.name,
@@ -987,7 +1147,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
                 "metadata": {
                     "handler_name": f"__skill__{skill.name}",  # 不存在的名字，触发 invoke_component 回退
                     "description": skill.description,
-                    "parameters": params,
+                    "parameters_raw": params_schema,
                 },
             })
 
@@ -998,10 +1158,11 @@ class SkillLoaderPlugin(MaiBotPlugin):
             "metadata": {
                 "handler_name": "__skill__command",  # 不存在的名字，触发 invoke_component 回退
                 "description": "管理 Agent Skills",
-                "parameters": {
-                    "action": {"type": "string", "description": "list|caps|enable|disable|reload", "required": True},
-                    "target": {"type": "string", "description": "能力名称或 all", "required": False},
-                },
+                "command_pattern": (
+                    r"^/skill(?:\s+(?P<action>list|caps|enable|disable|reload)"
+                    r"(?:\s+(?P<target>\S+))?)?$"
+                ),
+                "intercept_message_level": 1,
             },
         })
 
@@ -1037,6 +1198,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
             return {"name": name, "content": f"未找到 skill: {name}"}
 
         stream_id = kwargs.get("stream_id", "")
+        task_key = _build_task_key(stream_id, skill.name)
         cap_cfg = self.config.capabilities
         timeout = self.config.timeout_seconds
 
@@ -1052,7 +1214,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
                 )
                 if stream_id:
                     await self.ctx.send.text(notice, stream_id)
-                return {"name": skill.name, "content": f"执行失败：所需能力未开启，已通知用户。"}
+                return {"name": skill.name, "content": "执行失败：所需能力未开启，已通知用户。"}
 
         # 部分权限缺失时通知用户
         if denied_caps and stream_id:
@@ -1062,13 +1224,13 @@ class SkillLoaderPlugin(MaiBotPlugin):
             )
 
         # 检查后台任务结果
-        bg_result = self._task_mgr.get_result(skill.name)
+        bg_result = self._task_mgr.get_result(task_key)
         if bg_result is not None:
             if stream_id and bg_result:
                 await self.ctx.send.text(_strip_markdown(bg_result), stream_id)
                 return {"name": skill.name, "content": f"[{skill.name}] 后台任务完成，已将结果直接发送给用户。"}
             return {"name": skill.name, "content": bg_result}
-        if self._task_mgr.is_running(skill.name):
+        if self._task_mgr.is_running(task_key):
             return {"name": skill.name, "content": f"{skill.name} 正在后台执行中，请稍后再次调用。"}
 
         # 执行 skill（带超时 + shield）
@@ -1079,7 +1241,17 @@ class SkillLoaderPlugin(MaiBotPlugin):
             chat_context = ""
             if stream_id:
                 chat_context = await self._get_chat_context(stream_id)
-            coro = run_agent_loop(skill, task, self.ctx, self.config, chat_context=chat_context, stream_id=stream_id)
+            skills_dir = Path(self._last_loaded_skills_dir) if self._last_loaded_skills_dir else None
+            coro = run_agent_loop(
+                skill,
+                task,
+                self.ctx,
+                self.config,
+                chat_context=chat_context,
+                stream_id=stream_id,
+                plugin_dir=Path(__file__).parent,
+                skills_dir=skills_dir,
+            )
 
         real_task = asyncio.ensure_future(coro)
         try:
@@ -1091,7 +1263,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
             return {"name": skill.name, "content": result}
         except asyncio.TimeoutError:
             # 超时：shield 保护了 real_task，它继续在后台跑
-            self._task_mgr.shield_and_track(skill.name, real_task)
+            self._task_mgr.shield_and_track(task_key, real_task)
             return {
                 "name": skill.name,
                 "content": f"{skill.name} 执行超时 ({timeout}s)，已转为后台运行。稍后再次调用可获取结果。",
@@ -1099,16 +1271,50 @@ class SkillLoaderPlugin(MaiBotPlugin):
         except Exception as e:
             return {"name": skill.name, "content": f"执行异常: {e}"}
 
+    async def _send_skill_command_reply(self, stream_id: str, message: str) -> str:
+        """向聊天流发送 /skill 命令回复。"""
+        if stream_id and message:
+            await self.ctx.send.text(message, stream_id)
+        return message
+
     async def _handle_skill_command(self, action: str = "list", target: str = "", **kwargs) -> str:
         """处理 /skill 命令。"""
+        stream_id = str(kwargs.get("stream_id") or "").strip()
+        matched_groups = kwargs.get("matched_groups")
+        if isinstance(matched_groups, dict):
+            action = str(matched_groups.get("action") or action or "list").strip() or "list"
+            target = str(matched_groups.get("target") or target or "").strip()
+        else:
+            raw_text = str(kwargs.get("text") or "").strip()
+            match = re.match(
+                r"^/skill(?:\s+(?P<action>list|caps|enable|disable|reload)(?:\s+(?P<target>\S+))?)?$",
+                raw_text,
+            )
+            if match:
+                action = str(match.group("action") or "list").strip() or "list"
+                target = str(match.group("target") or "").strip()
+
+        user_id = str(kwargs.get("user_id") or "").strip()
+        platform = str(kwargs.get("platform") or "").strip()
+        admin_only_actions = {"enable", "disable", "reload"}
+        if action in admin_only_actions and not _is_admin(
+            user_id,
+            self.config.capabilities.admin_ids,
+            platform,
+        ):
+            return await self._send_skill_command_reply(
+                stream_id,
+                "仅管理员可执行此操作，请在配置 capabilities.admin_ids 中设置管理员。",
+            )
+
         if action == "list":
             if not self._skills:
-                return "当前没有加载任何 skill。"
+                return await self._send_skill_command_reply(stream_id, "当前没有加载任何 skill。")
             lines = ["已加载的 Skills:"]
             for s in self._skills.values():
                 caps = f" [{', '.join(s.capabilities)}]" if s.capabilities else ""
                 lines.append(f"  - {s.name} ({s.mode}): {s.description}{caps}")
-            return "\n".join(lines)
+            return await self._send_skill_command_reply(stream_id, "\n".join(lines))
 
         elif action == "caps":
             cfg = self.config.capabilities
@@ -1120,19 +1326,25 @@ class SkillLoaderPlugin(MaiBotPlugin):
             for name, enabled in status.items():
                 icon = "ON" if enabled else "OFF"
                 lines.append(f"  {name}: {icon}")
-            return "\n".join(lines)
+            return await self._send_skill_command_reply(stream_id, "\n".join(lines))
 
         elif action == "enable":
-            return self._set_cap(target, True)
+            return await self._send_skill_command_reply(stream_id, self._set_cap(target, True))
 
         elif action == "disable":
-            return self._set_cap(target, False)
+            return await self._send_skill_command_reply(stream_id, self._set_cap(target, False))
 
         elif action == "reload":
             self._load_skills()
-            return f"已重新加载，当前 {len(self._skills)} 个 skill: {list(self._skills.keys())}"
+            return await self._send_skill_command_reply(
+                stream_id,
+                f"已重新加载，当前 {len(self._skills)} 个 skill: {list(self._skills.keys())}",
+            )
 
-        return f"未知操作: {action}。可用: list, caps, enable, disable, reload"
+        return await self._send_skill_command_reply(
+            stream_id,
+            f"未知操作: {action}。可用: list, caps, enable, disable, reload",
+        )
 
     def _set_cap(self, target: str, enable: bool) -> str:
         """设置 capability 开关。"""
@@ -1162,6 +1374,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         """处理配置热更新。"""
         if scope == "self":
+            self._load_skills()
             logger.info("Skill Loader 配置已更新")
 
 

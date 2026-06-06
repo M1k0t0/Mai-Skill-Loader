@@ -112,7 +112,7 @@ metadata:
 | `/skill caps` | 查看能力权限状态 |
 | `/skill enable bash` | 开启 bash 能力 |
 | `/skill enable all` | 开启所有能力 |
-| `/skill disable python` | 关闭 python 能力 |
+| `/skill disable write` | 关闭写入能力 |
 | `/skill reload` | 重新加载 skill（添加新 skill 后使用） |
 
 ## 能力权限
@@ -121,11 +121,10 @@ metadata:
 
 | 能力 | 默认 | 说明 |
 |------|------|------|
-| `read_file` | 开启 | 读取文件 |
-| `http` | 开启 | 发起网络请求 |
-| `bash` | 关闭 | 执行 shell 命令 |
-| `python` | 关闭 | 执行 Python 代码 |
-| `write_file` | 关闭 | 写入文件 |
+| `bash` | 开启（需管理员审批） | 执行 shell 命令 |
+| `read` | 开启 | 读取文件 |
+| `write` | 关闭 | 写入文件 |
+| `edit` | 关闭 | 查找替换文件 |
 
 当 skill 需要的能力未开启时，bot 会直接告诉你需要执行什么命令来开启。
 
@@ -163,7 +162,7 @@ metadata:
 |------|------|------|
 | `name` | 是 | 小写字母、数字和连字符，需与文件夹名一致 |
 | `description` | 是 | 描述功能和触发条件，bot 根据这个决定何时调用 |
-| `allowed-tools` | 否 | 需要的能力，如 `Bash Read Write Http Python` |
+| `allowed-tools` | 否 | 需要的能力，如 `Bash Read Write Edit` |
 | `license` | 否 | 许可证 |
 | `compatibility` | 否 | 环境要求 |
 | `metadata` | 否 | 扩展字段 |
