@@ -110,9 +110,10 @@ metadata:
 |------|------|
 | `/skill list` | 查看已加载的所有 skill |
 | `/skill caps` | 查看能力权限状态 |
-| `/skill enable bash` | 开启 bash 能力 |
+| `/skill enable bash` | 全局开启 bash 能力 |
+| `/skill enable bash code-analyzer` | 仅为 code-analyzer 开启 bash |
 | `/skill enable all` | 开启所有能力 |
-| `/skill disable write` | 关闭写入能力 |
+| `/skill disable write code-analyzer` | 关闭 code-analyzer 的 write 能力 |
 | `/skill reload` | 重新加载 skill（添加新 skill 后使用） |
 
 ## 能力权限
@@ -127,6 +128,8 @@ metadata:
 | `edit` | 关闭 | 查找替换文件 |
 
 当 skill 需要的能力未开启时，bot 会直接告诉你需要执行什么命令来开启。
+
+未单独配置的 skill 会继承全局 capability 开关；使用 `/skill enable <cap> <skill>` 后会切换为该 skill 的独立授权模式。
 
 ## 编写自己的 Skill
 

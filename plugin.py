@@ -12,7 +12,7 @@
 """
 
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set
 
 import asyncio
 import importlib.util
@@ -340,11 +340,68 @@ CAPABILITY_SCHEMAS: Dict[str, Dict[str, Any]] = {
 }
 
 
-def get_allowed_caps(skill: SkillDefinition, cap_cfg: CapabilitiesConfig) -> List[str]:
-    """返回 skill 实际被允许的 capabilities。"""
-    perm = {"bash": cap_cfg.allow_bash, "read": cap_cfg.allow_read,
-            "write": cap_cfg.allow_write, "edit": cap_cfg.allow_edit}
-    return [c for c in skill.capabilities if perm.get(c, False)]
+CAPABILITY_NAMES: tuple[str, ...] = ("bash", "read", "write", "edit")
+CAPABILITY_CONFIG_ATTRS: Dict[str, str] = {
+    "bash": "allow_bash",
+    "read": "allow_read",
+    "write": "allow_write",
+    "edit": "allow_edit",
+}
+SKILL_COMMAND_PATTERN = (
+    r"^/skill(?:\s+(?P<action>list|caps|enable|disable|reload)"
+    r"(?:\s+(?P<target>\S+)(?:\s+(?P<skill_name>\S+))?)?)?$"
+)
+
+
+class SkillCapGrantStore:
+    """Per-skill capability 运行时授权。未单独配置的 skill 继承全局开关。"""
+
+    def __init__(self) -> None:
+        self._grants: Dict[str, Set[str]] = {}
+
+    def is_configured(self, skill_name: str) -> bool:
+        return skill_name in self._grants
+
+    def get_granted(self, skill_name: str) -> Optional[Set[str]]:
+        return self._grants.get(skill_name)
+
+    def ensure_initialized(self, skill_name: str, inherited_caps: Iterable[str]) -> Set[str]:
+        if skill_name not in self._grants:
+            self._grants[skill_name] = set(inherited_caps)
+        return self._grants[skill_name]
+
+    def prune(self, valid_skill_names: Iterable[str]) -> None:
+        valid = set(valid_skill_names)
+        for name in list(self._grants):
+            if name not in valid:
+                del self._grants[name]
+
+    def reset_skill(self, skill_name: str) -> None:
+        self._grants.pop(skill_name, None)
+
+
+def _global_allowed_caps(skill: SkillDefinition, cap_cfg: CapabilitiesConfig) -> List[str]:
+    """返回仅受全局开关约束的 capabilities。"""
+    perm = {
+        "bash": cap_cfg.allow_bash,
+        "read": cap_cfg.allow_read,
+        "write": cap_cfg.allow_write,
+        "edit": cap_cfg.allow_edit,
+    }
+    return [cap for cap in skill.capabilities if perm.get(cap, False)]
+
+
+def get_allowed_caps(
+    skill: SkillDefinition,
+    cap_cfg: CapabilitiesConfig,
+    grant_store: Optional[SkillCapGrantStore] = None,
+) -> List[str]:
+    """返回 skill 实际被允许的 capabilities（全局开关 + 可选 per-skill 授权）。"""
+    global_allowed = _global_allowed_caps(skill, cap_cfg)
+    if grant_store is None or not grant_store.is_configured(skill.name):
+        return global_allowed
+    explicit = grant_store.get_granted(skill.name) or set()
+    return [cap for cap in global_allowed if cap in explicit]
 
 
 def _resolve_read_roots(
@@ -850,6 +907,7 @@ async def run_agent_loop(
     skill: SkillDefinition, task: str, ctx: Any, config: SkillLoaderConfig,
     chat_context: str = "", stream_id: str = "", plugin_dir: Optional[Path] = None,
     skills_dir: Optional[Path] = None,
+    grant_store: Optional[SkillCapGrantStore] = None,
 ) -> str:
     """执行 agent 模式 skill。"""
     model = skill.model or config.default_model
@@ -862,7 +920,7 @@ async def run_agent_loop(
 
     # 构建 tools = scripts + allowed capabilities
     tools = _build_script_tools(skill)
-    allowed_caps = get_allowed_caps(skill, cap_cfg)
+    allowed_caps = get_allowed_caps(skill, cap_cfg, grant_store)
     denied_caps = [c for c in skill.capabilities if c not in allowed_caps]
     for cap in allowed_caps:
         if cap in CAPABILITY_SCHEMAS:
@@ -1097,6 +1155,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
         super().__init__()
         self._skills: Dict[str, SkillDefinition] = {}
         self._task_mgr = TaskManager()
+        self._cap_grants = SkillCapGrantStore()
         self._last_loaded_skills_dir = ""
 
     @property
@@ -1110,6 +1169,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
         skills_dir = configured_skills_dir if configured_skills_dir.is_absolute() else plugin_dir / configured_skills_dir
         self._skills = scan_skills(skills_dir)
         self._last_loaded_skills_dir = str(skills_dir)
+        self._cap_grants.prune(self._skills.keys())
         _clear_script_cache()
         if self._skills:
             logger.info(f"Skill Loader: 加载了 {len(self._skills)} 个 skill: {list(self._skills.keys())}")
@@ -1158,10 +1218,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
             "metadata": {
                 "handler_name": "__skill__command",  # 不存在的名字，触发 invoke_component 回退
                 "description": "管理 Agent Skills",
-                "command_pattern": (
-                    r"^/skill(?:\s+(?P<action>list|caps|enable|disable|reload)"
-                    r"(?:\s+(?P<target>\S+))?)?$"
-                ),
+                "command_pattern": SKILL_COMMAND_PATTERN,
                 "intercept_message_level": 1,
             },
         })
@@ -1205,12 +1262,12 @@ class SkillLoaderPlugin(MaiBotPlugin):
         # 权限检查
         denied_caps: List[str] = []
         if skill.capabilities:
-            allowed = get_allowed_caps(skill, cap_cfg)
+            allowed = get_allowed_caps(skill, cap_cfg, self._cap_grants)
             denied_caps = [c for c in skill.capabilities if c not in allowed]
             if denied_caps and not allowed and skill.mode == "agent":
                 notice = (
                     f"[Skill Loader] {skill.name} 需要以下能力但均未开启: {', '.join(denied_caps)}\n"
-                    f"请使用 /skill enable <capability> 开启。"
+                    f"请使用 /skill enable <capability> {skill.name} 开启。"
                 )
                 if stream_id:
                     await self.ctx.send.text(notice, stream_id)
@@ -1251,6 +1308,7 @@ class SkillLoaderPlugin(MaiBotPlugin):
                 stream_id=stream_id,
                 plugin_dir=Path(__file__).parent,
                 skills_dir=skills_dir,
+                grant_store=self._cap_grants,
             )
 
         real_task = asyncio.ensure_future(coro)
@@ -1280,19 +1338,19 @@ class SkillLoaderPlugin(MaiBotPlugin):
     async def _handle_skill_command(self, action: str = "list", target: str = "", **kwargs) -> str:
         """处理 /skill 命令。"""
         stream_id = str(kwargs.get("stream_id") or "").strip()
+        skill_name = ""
         matched_groups = kwargs.get("matched_groups")
         if isinstance(matched_groups, dict):
             action = str(matched_groups.get("action") or action or "list").strip() or "list"
             target = str(matched_groups.get("target") or target or "").strip()
+            skill_name = str(matched_groups.get("skill_name") or "").strip()
         else:
             raw_text = str(kwargs.get("text") or "").strip()
-            match = re.match(
-                r"^/skill(?:\s+(?P<action>list|caps|enable|disable|reload)(?:\s+(?P<target>\S+))?)?$",
-                raw_text,
-            )
+            match = re.match(SKILL_COMMAND_PATTERN, raw_text)
             if match:
                 action = str(match.group("action") or "list").strip() or "list"
                 target = str(match.group("target") or "").strip()
+                skill_name = str(match.group("skill_name") or "").strip()
 
         user_id = str(kwargs.get("user_id") or "").strip()
         platform = str(kwargs.get("platform") or "").strip()
@@ -1311,8 +1369,10 @@ class SkillLoaderPlugin(MaiBotPlugin):
             if not self._skills:
                 return await self._send_skill_command_reply(stream_id, "当前没有加载任何 skill。")
             lines = ["已加载的 Skills:"]
+            cap_cfg = self.config.capabilities
             for s in self._skills.values():
-                caps = f" [{', '.join(s.capabilities)}]" if s.capabilities else ""
+                effective = get_allowed_caps(s, cap_cfg, self._cap_grants)
+                caps = f" [{', '.join(effective)}]" if effective else ""
                 lines.append(f"  - {s.name} ({s.mode}): {s.description}{caps}")
             return await self._send_skill_command_reply(stream_id, "\n".join(lines))
 
@@ -1322,17 +1382,38 @@ class SkillLoaderPlugin(MaiBotPlugin):
                 "bash": cfg.allow_bash, "read": cfg.allow_read,
                 "write": cfg.allow_write, "edit": cfg.allow_edit,
             }
-            lines = ["Capabilities 状态:"]
+            lines = ["Capabilities 全局状态:"]
             for name, enabled in status.items():
                 icon = "ON" if enabled else "OFF"
                 lines.append(f"  {name}: {icon}")
+            if self._skills:
+                lines.append("")
+                lines.append("Skill 授权状态:")
+                for s in self._skills.values():
+                    effective = get_allowed_caps(s, cfg, self._cap_grants)
+                    if self._cap_grants.is_configured(s.name):
+                        detail = ", ".join(effective) if effective else "无"
+                        lines.append(f"  {s.name}: {detail}")
+                    else:
+                        inherited = ", ".join(_global_allowed_caps(s, cfg)) if _global_allowed_caps(s, cfg) else "无"
+                        lines.append(f"  {s.name}: 继承全局 ({inherited})")
             return await self._send_skill_command_reply(stream_id, "\n".join(lines))
 
         elif action == "enable":
-            return await self._send_skill_command_reply(stream_id, self._set_cap(target, True))
+            if skill_name:
+                return await self._send_skill_command_reply(
+                    stream_id,
+                    self._set_skill_cap(skill_name, target, True),
+                )
+            return await self._send_skill_command_reply(stream_id, self._set_global_cap(target, True))
 
         elif action == "disable":
-            return await self._send_skill_command_reply(stream_id, self._set_cap(target, False))
+            if skill_name:
+                return await self._send_skill_command_reply(
+                    stream_id,
+                    self._set_skill_cap(skill_name, target, False),
+                )
+            return await self._send_skill_command_reply(stream_id, self._set_global_cap(target, False))
 
         elif action == "reload":
             self._load_skills()
@@ -1346,24 +1427,52 @@ class SkillLoaderPlugin(MaiBotPlugin):
             f"未知操作: {action}。可用: list, caps, enable, disable, reload",
         )
 
-    def _set_cap(self, target: str, enable: bool) -> str:
-        """设置 capability 开关。"""
+    def _set_global_cap(self, target: str, enable: bool) -> str:
+        """设置全局 capability 开关。"""
         cfg = self.config.capabilities
-        cap_map = {
-            "bash": "allow_bash", "read": "allow_read",
-            "write": "allow_write", "edit": "allow_edit",
-        }
         action_word = "开启" if enable else "关闭"
 
         if target == "all":
-            for attr in cap_map.values():
+            for attr in CAPABILITY_CONFIG_ATTRS.values():
                 setattr(cfg, attr, enable)
-            return f"已{action_word}所有 capabilities。"
-        elif target in cap_map:
-            setattr(cfg, cap_map[target], enable)
-            return f"已{action_word} {target}。"
+            return f"已{action_word}所有全局 capabilities。"
+        if target in CAPABILITY_CONFIG_ATTRS:
+            setattr(cfg, CAPABILITY_CONFIG_ATTRS[target], enable)
+            return f"已{action_word}全局 {target}。"
+        return f"未知 capability: {target}。可用: {', '.join(CAPABILITY_NAMES)}, all"
+
+    def _set_skill_cap(self, skill_name: str, target: str, enable: bool) -> str:
+        """设置单个 skill 的 capability 授权。"""
+        skill = self._skills.get(skill_name)
+        if not skill:
+            return f"未找到 skill: {skill_name}。"
+
+        cap_cfg = self.config.capabilities
+        action_word = "开启" if enable else "关闭"
+        inherited = _global_allowed_caps(skill, cap_cfg)
+        grants = self._cap_grants.ensure_initialized(skill.name, inherited)
+
+        if target == "all":
+            if enable:
+                grants.update(inherited)
+            else:
+                grants.clear()
+            return f"已为 {skill_name} {action_word}全部可用 capabilities。"
+
+        if target not in CAPABILITY_NAMES:
+            return f"未知 capability: {target}。可用: {', '.join(CAPABILITY_NAMES)}, all"
+
+        if target not in skill.capabilities:
+            return f"Skill {skill_name} 未声明 {target} 能力。"
+
+        if target not in inherited:
+            return f"全局 {target} 未开启，无法为 {skill_name} 单独授权。"
+
+        if enable:
+            grants.add(target)
         else:
-            return f"未知 capability: {target}。可用: {', '.join(cap_map.keys())}, all"
+            grants.discard(target)
+        return f"已为 {skill_name} {action_word} {target}。"
 
     async def on_load(self) -> None:
         logger.info(f"Skill Loader 已启动，{len(self._skills)} 个 skill 就绪")
