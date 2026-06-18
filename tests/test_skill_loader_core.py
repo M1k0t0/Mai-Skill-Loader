@@ -861,7 +861,7 @@ class TestAgentLoop:
         assert fake_sandbox.exited is True
 
     @pytest.mark.asyncio
-    async def test_run_agent_loop_logs_maibot_model_list_then_falls_back_when_model_missing(
+    async def test_run_agent_loop_logs_available_models_when_configured_model_missing(
         self,
         plugin_module,
         tmp_path: Path,
@@ -884,35 +884,14 @@ class TestAgentLoop:
 
         class FakeLLM:
             def __init__(self) -> None:
-                self.calls = 0
                 self.models: list[str] = []
 
-            async def list_models(self):
-                return [
-                    {"name": "gemini-pro-agent"},
-                    {"name": "fallback-agent"},
-                ]
+            async def get_available_models(self):
+                return ["gemini-pro-agent", "fallback-agent"]
 
             async def generate_with_tools(self, prompt, tools, model):
-                self.calls += 1
                 self.models.append(model)
-                if model == "gemini-pro-agent":
-                    raise RuntimeError("未找到名为 `gemini-pro-agent` 的模型配置")
-                if self.calls == 2:
-                    return {
-                        "success": True,
-                        "response": "",
-                        "tool_calls": [
-                            {
-                                "id": "tc1",
-                                "function": {
-                                    "name": "read",
-                                    "arguments": '{"path": "/workspace/skill/note.txt"}',
-                                },
-                            }
-                        ],
-                    }
-                return {"success": True, "response": "完成", "tool_calls": []}
+                raise RuntimeError("未找到名为 `gemini-pro-agent` 的模型配置")
 
         llm = FakeLLM()
         caplog.set_level(logging.WARNING, logger="skill_loader")
@@ -928,10 +907,9 @@ class TestAgentLoop:
                 sandbox_client=fake_sandbox,
             )
 
-        assert result == "完成"
-        assert llm.models == ["gemini-pro-agent", "", "gemini-pro-agent", ""]
-        assert "visible_models(list_models)=gemini-pro-agent, fallback-agent" in caplog.text
-        assert "回退到系统默认模型" in caplog.text
+        assert "Agent LLM 调用失败" in result
+        assert llm.models == ["gemini-pro-agent"]
+        assert "available_models=gemini-pro-agent, fallback-agent" in caplog.text
 
     @pytest.mark.asyncio
     async def test_run_agent_loop_destroys_sandbox_on_llm_error(self, plugin_module, tmp_path: Path) -> None:

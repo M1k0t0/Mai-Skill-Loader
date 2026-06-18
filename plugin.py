@@ -1253,97 +1253,43 @@ def _is_missing_model_error(error: Any) -> bool:
     return "未找到名为" in text and "模型配置" in text
 
 
-def _extract_model_names_from_listing(value: Any) -> List[str]:
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value] if value else []
-    if isinstance(value, dict):
-        for key in ("name", "model", "model_name", "id", "key"):
-            item_value = value.get(key)
-            if item_value:
-                return [str(item_value)]
-        for key in ("models", "model_list", "model_configs", "configs", "data"):
-            if key in value:
-                names = _extract_model_names_from_listing(value.get(key))
-                if names:
-                    return names
-        return [str(key) for key in value.keys() if str(key)]
-    if isinstance(value, (list, tuple, set)):
-        names: List[str] = []
-        for item in value:
-            names.extend(_extract_model_names_from_listing(item))
-        return names
-    if isinstance(value, (int, float, bool)):
-        return []
-
-    for attr in ("name", "model", "model_name", "id", "key"):
-        attr_value = getattr(value, attr, None)
-        if attr_value:
-            return [str(attr_value)]
-    return []
-
-
-async def _read_llm_model_listing(ctx: Any) -> tuple[str, List[str]]:
+async def _read_llm_model_listing(ctx: Any) -> List[str]:
     llm = getattr(ctx, "llm", None)
     if llm is None:
-        return "ctx.llm", []
-
-    for attr in (
-        "list_models",
-        "get_models",
-        "models",
-        "list_model_configs",
-        "get_model_configs",
-        "model_configs",
-        "available_models",
-    ):
-        if not hasattr(llm, attr):
-            continue
-        source = getattr(llm, attr)
-        try:
-            value = source() if callable(source) else source
-            if asyncio.iscoroutine(value):
-                value = await value
-        except TypeError:
-            continue
-        except Exception as exc:
-            logger.warning(f"读取 MaiBot LLM 模型列表失败 ({attr}): {exc}")
-            continue
-        names = _extract_model_names_from_listing(value)
-        if names:
-            seen: set[str] = set()
-            unique = [name for name in names if not (name in seen or seen.add(name))]
-            return attr, unique
-    return "unknown", []
+        return []
+    if not hasattr(llm, "get_available_models"):
+        logger.warning("MaiBot LLM capability 缺少 get_available_models()，无法读取模型列表")
+        return []
+    try:
+        models = await llm.get_available_models()
+    except Exception as exc:
+        logger.warning(f"读取 MaiBot LLM 可用模型列表失败: {exc}")
+        return []
+    if not isinstance(models, list):
+        logger.warning(f"MaiBot LLM get_available_models() 返回类型异常: {type(models).__name__}")
+        return []
+    seen: set[str] = set()
+    return [str(name) for name in models if str(name) and not (str(name) in seen or seen.add(str(name)))]
 
 
 async def _log_llm_model_list(ctx: Any, requested_model: str, error: Any) -> None:
-    source, names = await _read_llm_model_listing(ctx)
+    names = await _read_llm_model_listing(ctx)
     if names:
         logger.warning(
-            "MaiBot LLM 模型查找失败: requested=%r error=%s visible_models(%s)=%s",
+            "MaiBot LLM 模型查找失败: requested=%r error=%s available_models=%s",
             requested_model,
             error,
-            source,
             ", ".join(names),
         )
         return
-
-    llm = getattr(ctx, "llm", None)
-    attrs = []
-    if llm is not None:
-        attrs = [attr for attr in dir(llm) if not attr.startswith("_")][:50]
     logger.warning(
-        "MaiBot LLM 模型查找失败: requested=%r error=%s; 未能读取模型列表 source=%s attrs=%s",
+        "MaiBot LLM 模型查找失败: requested=%r error=%s; available_models=<unavailable>",
         requested_model,
         error,
-        source,
-        ", ".join(attrs),
     )
 
 
-async def _generate_with_model_fallback(
+async def _generate_with_model_diagnostics(
     ctx: Any,
     messages: List[Dict[str, Any]],
     tools: List[Dict[str, Any]],
@@ -1359,14 +1305,10 @@ async def _generate_with_model_fallback(
     except Exception as exc:
         if model and _is_missing_model_error(exc):
             await _log_llm_model_list(ctx, model, exc)
-            logger.warning(f"模型 {model!r} 不存在，回退到系统默认模型")
-            return await call("")
         raise
 
     if model and not result.get("success", False) and _is_missing_model_error(result.get("error", "")):
         await _log_llm_model_list(ctx, model, result.get("error", ""))
-        logger.warning(f"模型 {model!r} 不存在，回退到系统默认模型")
-        return await call("")
     return result
 
 
@@ -1472,7 +1414,7 @@ async def run_agent_loop(
             messages = _truncate_messages(messages, max_tokens)
 
             try:
-                result = await _generate_with_model_fallback(ctx, messages, tools, model)
+                result = await _generate_with_model_diagnostics(ctx, messages, tools, model)
             except Exception as e:
                 final_result = f"Agent LLM 调用失败: {e}"
                 break
