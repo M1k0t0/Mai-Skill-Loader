@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -894,13 +894,14 @@ class TestAgentLoop:
                 raise RuntimeError("未找到名为 `gemini-pro-agent` 的模型配置")
 
         llm = FakeLLM()
+        ctx_logger = Mock()
         caplog.set_level(logging.WARNING, logger="skill_loader")
 
         with caplog.at_level(logging.WARNING, logger="skill_loader"):
             result = await plugin_module.run_agent_loop(
                 skill,
                 "读取文件",
-                SimpleNamespace(llm=llm),
+                SimpleNamespace(llm=llm, logger=ctx_logger),
                 config,
                 plugin_dir=tmp_path,
                 skills_dir=tmp_path,
@@ -908,8 +909,10 @@ class TestAgentLoop:
             )
 
         assert "Agent LLM 调用失败" in result
+        assert "MaiBot 可用模型: gemini-pro-agent, fallback-agent" in result
         assert llm.models == ["gemini-pro-agent"]
         assert "available_models=gemini-pro-agent, fallback-agent" in caplog.text
+        ctx_logger.warning.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_run_agent_loop_destroys_sandbox_on_llm_error(self, plugin_module, tmp_path: Path) -> None:
