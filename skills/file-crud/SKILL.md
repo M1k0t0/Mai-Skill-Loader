@@ -1,6 +1,6 @@
 ---
 name: file-crud
-description: 文件管理工具。当消息中出现[文件]标记或用户要求下载/读取/保存文件时使用。能下载URL文件、读取文档（txt/md/docx/pdf）、写入文件、列出目录。
+description: 文件管理工具。当消息中出现[文件]标记或用户要求下载/读取/保存文件时使用。能在 sandbox 中下载URL文件、读取文本文件、写入文件、列出目录。
 allowed-tools: Bash Read Write Edit
 metadata:
   maibot-mode: agent
@@ -14,7 +14,7 @@ metadata:
 
 ## 工作范围
 
-所有文件操作限制在 `data/` 目录内。不要访问其他目录。
+所有文件操作限制在 sandbox 的 `data/` 目录内。不要访问其他目录。
 
 ## 能力
 
@@ -26,7 +26,7 @@ curl -L -o data/<filename> "<url>"
 
 ### 读取文件
 - txt/md 文件：直接使用 read 工具
-- docx/pdf 文件：直接使用 read 工具（已内置解析支持）
+- docx/pdf 等二进制文档取决于 sandbox read_file 能力；不能可靠读取时说明不支持
 
 ### 写入文件
 使用 write 工具创建或覆盖 data/ 下的文件。

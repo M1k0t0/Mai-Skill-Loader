@@ -1,6 +1,6 @@
 # Mai-Skill-Loader
 
-为MaiBot（MaiSaka）提供标准的[Agent Skills](https://agentskills.io)兼容支持，允许独立配置skill调用的LLM以获得更好的效果
+为MaiBot（MaiSaka）提供标准的[Agent Skills](https://agentskills.io)兼容支持，允许独立配置skill调用的LLM以获得更好的效果。agent 运行时的 Bash 和文件读写能力通过 MCP sandbox 执行。
 
 ## 快速开始
 
@@ -67,7 +67,7 @@ skill 的执行结果会直接发送到聊天中，不需要额外等待。
 
 1. bot（Maisaka）收到用户消息，判断需要使用某个 skill
 2. 插件启动一个独立 AI，把 skill 的指令和用户的需求交给它
-3. 这个 AI 可以多轮调用工具（执行命令、读文件、发请求等）来完成任务
+3. 这个 AI 可以多轮调用工具，在独立 MCP sandbox 中执行命令、读写文件、发请求等来完成任务
 4. 完成后，结果直接发送到聊天中
 
 举个例子，假设安装了 `code-analyzer` skill：
@@ -118,18 +118,22 @@ metadata:
 
 ## 能力权限
 
-部分 skill 需要特定能力才能工作（比如执行命令、读写文件）。出于安全考虑，默认只开启了安全的能力：
+部分 skill 需要特定能力才能工作（比如执行命令、读写文件）。这些运行时能力只作用于每次 skill 调用创建的 MCP sandbox：
 
 | 能力 | 默认 | 说明 |
 |------|------|------|
-| `bash` | 开启（需管理员审批） | 执行 shell 命令 |
-| `read` | 开启 | 读取文件 |
-| `write` | 关闭 | 写入文件 |
-| `edit` | 关闭 | 查找替换文件 |
+| `bash` | 开启（需管理员审批） | 在 sandbox 中执行 shell 命令 |
+| `read` | 开启 | 读取 sandbox 文件 |
+| `write` | 关闭 | 写入 sandbox 文件 |
+| `edit` | 关闭 | 查找替换 sandbox 文件 |
 
 当 skill 需要的能力未开启时，bot 会直接告诉你需要执行什么命令来开启。
 
 未单独配置的 skill 会继承全局 capability 开关；使用 `/skill enable <cap> <skill>` 后会切换为该 skill 的独立授权模式。
+
+每次 skill 调用创建 sandbox 后，当前 skill 目录会同步到 sandbox 的 `skill_mount_path`（默认 `/workspace/skill`）。agent 可以使用 `read` 工具读取 `references/`、`assets/`、`scripts/` 等资源。
+
+`scripts/` 中声明的工具不会在插件宿主进程中 import 或执行；插件只静态读取 `TOOL_SCHEMA`。配置 `sandbox.endpoint_url` 后，调用时会通过 sandbox 的 `execute_code` 执行已同步到 sandbox 的脚本；未配置 sandbox 时，这些 script tools 不会暴露给 agent。
 
 ## 编写自己的 Skill
 
@@ -174,21 +178,15 @@ metadata:
 
 | 字段 | 默认值 | 说明 |
 |------|--------|------|
-| `maibot-mode` | `agent` | `agent`=独立 AI 执行，`direct`=直接运行脚本 |
+| `maibot-mode` | `agent` | 仅支持 `agent`；`direct` 会在加载时跳过 |
 | `maibot-model` | 系统默认 | 指定使用的模型 |
 | `maibot-max-turns` | `10` | agent 模式最大对话轮数 |
 
-### 两种模式
+### 执行模式
 
 **agent 模式**（默认）：skill 的指令会交给一个独立的 AI 来执行，它可以使用 allowed-tools 中声明的能力多轮完成任务。适合复杂任务。
 
-**direct 模式**：直接运行 `scripts/` 目录下的第一个 Python 脚本的 `run()` 函数，适合简单的确定性任务。
-
-```python
-# scripts/my_script.py
-async def run(task: str) -> str:
-    return f"处理完成: {task}"
-```
+`direct` 模式不再支持。声明 `metadata.maibot-mode: direct` 的 skill 会在加载阶段跳过。
 
 ## 兼容性
 
@@ -199,7 +197,11 @@ async def run(task: str) -> str:
 插件配置通过 MaiBot 的插件配置系统管理，可在 WebUI 中修改：
 
 - 默认模型、最大轮数、超时时间
-- 各项能力的开关和安全策略（命令黑名单、目录白名单等）
+- MCP sandbox endpoint、transport、工作目录和请求超时
+- 各项 sandbox runtime capability 开关
+- skill 目录同步路径和大小上限
+
+`sandbox.endpoint_url` 可以配置为 Streamable HTTP 端点（例如 `http://localhost:18080/mcp`）或 SSE 端点。`sandbox.transport` 默认 `auto`，会对 `/mcp` 自动使用 `streamable_http`，其他路径默认使用 `sse`。
 
 ## 许可证
 

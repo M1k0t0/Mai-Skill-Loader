@@ -13,8 +13,8 @@ metadata:
 
 ## 工作流程
 
-1. 使用 bash 工具执行 `find` 和 `wc` 等命令统计文件数量和代码行数
-2. 使用 read_file 读取关键文件（如 README、配置文件）了解项目概况
+1. 使用 bash 工具在 sandbox 中执行 `find` 和 `wc` 等命令统计文件数量和代码行数
+2. 使用 read 工具读取 sandbox 内关键文件（如 README、配置文件）了解项目概况
 3. 综合分析后生成报告
 
 ## 输出格式

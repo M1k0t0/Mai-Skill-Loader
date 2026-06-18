@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "version": "1.0.0",
   "name": "MaiBot Agent Skills 加载器",
-  "description": "加载 Agent Skills 规范的 skill 文件夹，自动注册为 LLM 可调用的 Tool 组件。支持 direct 和 agent 两种执行模式。",
+  "description": "加载 Agent Skills 规范的 skill 文件夹，自动注册为 LLM 可调用的 Tool 组件。agent runtime 能力通过 MCP sandbox 执行。",
   "author": {
     "name": "CharTyr",
     "url": "https://github.com/CharTyr"
@@ -23,18 +23,13 @@
   "dependencies": [
     {
       "type": "python_package",
-      "name": "python-docx",
-      "version_spec": ">=1.1.2"
-    },
-    {
-      "type": "python_package",
-      "name": "pypdf",
-      "version_spec": ">=5.0.0"
-    },
-    {
-      "type": "python_package",
       "name": "PyYAML",
       "version_spec": ">=6.0.0"
+    },
+    {
+      "type": "python_package",
+      "name": "mcp",
+      "version_spec": ">=1.27,<2"
     }
   ],
   "capabilities": [

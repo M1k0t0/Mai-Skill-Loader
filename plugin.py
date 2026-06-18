@@ -4,23 +4,25 @@
 - 覆写 get_components() 动态返回 skill tools
 - 覆写 invoke_component() 统一分发 skill 调用
 - Agent loop 带 token budget 和 context 截断
-- Capabilities 带安全限制（bash 审批、路径白名单、高危命令黑名单）
+- Capabilities 通过 MCP sandbox 执行
 - 多轮会话缓存（stream_id + skill_name 维度）
 - 聊天上下文注入
 - /skill reload 热加载
 - /skill enable|disable 运行时开关
 """
 
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Dict, Iterable, List, Optional, Set
+from urllib.parse import urlparse
 
 import asyncio
-import importlib.util
+import ast
+import base64
 import json
 import logging
 import re
+import shlex
 import time
-import traceback
 
 import yaml
 
@@ -37,41 +39,32 @@ class CapabilitiesConfig(PluginConfigBase):
     __ui_icon__ = "shield"
     __ui_order__ = 1
 
-    allow_bash: bool = Field(default=True, description="允许执行 shell 命令")
-    allow_read: bool = Field(default=True, description="允许读取文件")
-    allow_write: bool = Field(default=False, description="允许写入文件")
-    allow_edit: bool = Field(default=False, description="允许编辑文件（查找替换）")
-    bash_working_dir: str = Field(default="", description="bash 工作目录（空=插件目录）")
-    bash_timeout: int = Field(default=30, description="bash 命令超时（秒）")
-    bash_blocked_commands: List[str] = Field(
-        default_factory=lambda: [
-            "rm -rf /", "rm -rf ~", "rm -rf .", "rmdir /",
-            "mkfs", "dd if=", "shutdown", "reboot", "poweroff", "init 0", "init 6",
-            "chmod -R 777 /", "chown -R", ":(){ :|:& };:",
-            "curl|bash", "curl|sh", "wget|bash", "wget|sh",
-            "> /dev/sda", "mv / ", "cat /dev/zero",
-            "passwd", "useradd", "userdel", "visudo",
-            "iptables -F", "ufw disable",
-            "systemctl stop", "systemctl disable",
-            "kill -9 1", "killall",
-        ],
-        description="禁止的命令模式",
-    )
-    read_allowed_dirs: List[str] = Field(
-        default_factory=list,
-        description="读取目录白名单（空=默认仅限插件目录）",
-    )
-    write_allowed_dirs: List[str] = Field(
-        default_factory=list,
-        description="写入目录白名单（空=默认仅限插件 data/ 目录）",
-    )
-    write_max_size_kb: int = Field(default=1024, description="写入文件最大 KB")
+    allow_bash: bool = Field(default=True, description="允许在 sandbox 中执行 shell 命令")
+    allow_read: bool = Field(default=True, description="允许读取 sandbox 文件")
+    allow_write: bool = Field(default=False, description="允许写入 sandbox 文件")
+    allow_edit: bool = Field(default=False, description="允许编辑 sandbox 文件（查找替换）")
+    write_max_size_kb: int = Field(default=1024, description="写入 sandbox 文件最大 KB")
     bash_require_approval: bool = Field(default=True, description="bash 命令是否需要管理员审批")
     bash_approval_timeout: int = Field(default=120, description="审批等待超时（秒）")
     admin_ids: List[str] = Field(
         default_factory=list,
         description="管理员 ID 列表（格式: 'qq:123456' 或纯数字 QQ 号）",
     )
+
+
+class SandboxConfig(PluginConfigBase):
+    """MCP sandbox 连接配置。"""
+    __ui_label__ = "Sandbox"
+    __ui_icon__ = "terminal"
+    __ui_order__ = 2
+
+    endpoint_url: str = Field(default="", description="MCP HTTP endpoint URL")
+    transport: str = Field(default="auto", description="MCP transport: auto, sse, streamable_http")
+    workdir: str = Field(default="/workspace", description="sandbox 内默认工作目录")
+    skill_mount_path: str = Field(default="/workspace/skill", description="当前 skill 同步到 sandbox 内的路径")
+    skill_sync_max_size_kb: int = Field(default=4096, description="同步单个 skill 目录最大 KB")
+    request_timeout: float = Field(default=30.0, description="MCP 请求超时（秒）")
+    sse_read_timeout: float = Field(default=300.0, description="SSE/streamable HTTP 读取超时（秒）")
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -100,6 +93,7 @@ class SkillLoaderConfig(PluginConfigBase):
     session_ttl_seconds: int = Field(default=300, description="会话过期时间（秒），超时未交互则清除")
     session_max_history: int = Field(default=20, description="会话最多保留的消息轮数（超出截断旧轮）")
     capabilities: CapabilitiesConfig = Field(default_factory=CapabilitiesConfig)
+    sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
 
 
 # ====== Skill 定义与解析 ======
@@ -234,7 +228,10 @@ def parse_skill(skill_path: Path) -> Optional[SkillDefinition]:
 
     # maibot 扩展（从 metadata 读取）
     mode = str(metadata.get("maibot-mode", "agent")).strip()
-    if mode not in ("direct", "agent"):
+    if mode == "direct":
+        logger.warning(f"Skill '{name}' 使用 direct 模式，sandbox 版本不再支持，已跳过")
+        return None
+    if mode != "agent":
         mode = "agent"
     model = str(metadata.get("maibot-model", "")).strip()
     max_turns_raw = metadata.get("maibot-max-turns", 10)
@@ -333,12 +330,11 @@ def scan_skills(skills_dir: Path) -> Dict[str, SkillDefinition]:
 # ====== Capabilities 执行器 ======
 
 CAPABILITY_SCHEMAS: Dict[str, Dict[str, Any]] = {
-    "bash": {"type": "function", "function": {"name": "bash", "description": "执行 shell 命令", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "shell 命令"}}, "required": ["command"]}}},
-    "read": {"type": "function", "function": {"name": "read", "description": "读取文件内容（支持 txt/md/docx/pdf）", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "文件路径"}, "max_lines": {"type": "integer", "description": "最大行数，默认200（仅文本文件有效）"}}, "required": ["path"]}}},
-    "write": {"type": "function", "function": {"name": "write", "description": "创建或覆盖文件", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "文件路径"}, "content": {"type": "string", "description": "文件内容"}}, "required": ["path", "content"]}}},
-    "edit": {"type": "function", "function": {"name": "edit", "description": "编辑文件：查找并替换指定内容", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "文件路径"}, "old_str": {"type": "string", "description": "要查找的原始文本"}, "new_str": {"type": "string", "description": "替换为的新文本"}}, "required": ["path", "old_str", "new_str"]}}},
+    "bash": {"type": "function", "function": {"name": "bash", "description": "在 MCP sandbox 中执行 shell 命令", "parameters": {"type": "object", "properties": {"command": {"type": "string", "description": "shell 命令"}}, "required": ["command"]}}},
+    "read": {"type": "function", "function": {"name": "read", "description": "读取 MCP sandbox 内文件内容", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "sandbox 内文件路径"}, "max_lines": {"type": "integer", "description": "最大行数，默认200"}}, "required": ["path"]}}},
+    "write": {"type": "function", "function": {"name": "write", "description": "创建或覆盖 MCP sandbox 内文件", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "sandbox 内文件路径"}, "content": {"type": "string", "description": "文件内容"}}, "required": ["path", "content"]}}},
+    "edit": {"type": "function", "function": {"name": "edit", "description": "编辑 MCP sandbox 内文件：查找并替换指定内容", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "sandbox 内文件路径"}, "old_str": {"type": "string", "description": "要查找的原始文本"}, "new_str": {"type": "string", "description": "替换为的新文本"}}, "required": ["path", "old_str", "new_str"]}}},
 }
-
 
 CAPABILITY_NAMES: tuple[str, ...] = ("bash", "read", "write", "edit")
 CAPABILITY_CONFIG_ATTRS: Dict[str, str] = {
@@ -404,29 +400,6 @@ def get_allowed_caps(
     return [cap for cap in global_allowed if cap in explicit]
 
 
-def _resolve_read_roots(
-    cfg_dirs: List[str],
-    plugin_dir: Optional[Path],
-    extra_roots: Optional[List[Path]] = None,
-) -> List[Path]:
-    """解析读取目录白名单；未配置时默认插件目录 + 当前 skill 等资源目录。"""
-    if cfg_dirs:
-        return [Path(d).resolve() for d in cfg_dirs]
-
-    roots: List[Path] = []
-    seen: set[str] = set()
-    for candidate in [plugin_dir, *(extra_roots or [])]:
-        if candidate is None:
-            continue
-        resolved = candidate.resolve()
-        key = str(resolved)
-        if key in seen:
-            continue
-        seen.add(key)
-        roots.append(resolved)
-    return roots
-
-
 def _coerce_max_lines(raw: Any, default: int = 200) -> int:
     """将 read.max_lines 参数安全转换为正整数。"""
     try:
@@ -436,17 +409,6 @@ def _coerce_max_lines(raw: Any, default: int = 200) -> int:
     return value if value > 0 else default
 
 
-def _resolve_write_roots(cfg_dirs: List[str], plugin_dir: Optional[Path]) -> List[Path]:
-    """解析写入目录白名单；未配置时默认仅限插件 data/ 目录。"""
-    if cfg_dirs:
-        return [Path(d).resolve() for d in cfg_dirs]
-    if plugin_dir is None:
-        return []
-    data_dir = (plugin_dir / "data").resolve()
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return [data_dir]
-
-
 def _is_path_allowed(fp: Path, allowed_roots: List[Path]) -> bool:
     """检查路径是否在白名单根目录下。"""
     if not allowed_roots:
@@ -454,36 +416,493 @@ def _is_path_allowed(fp: Path, allowed_roots: List[Path]) -> bool:
     return any(fp == root or root in fp.parents for root in allowed_roots)
 
 
+class SandboxMCPError(RuntimeError):
+    """MCP sandbox 执行错误。"""
+
+
+def _mcp_structured_content(result: Any) -> Any:
+    for attr in ("structuredContent", "structured_content"):
+        value = getattr(result, attr, None)
+        if value is not None:
+            return value
+    if isinstance(result, dict):
+        return result.get("structuredContent") or result.get("structured_content")
+    return None
+
+
+def _mcp_is_error(result: Any) -> bool:
+    if isinstance(result, dict):
+        return bool(result.get("isError") or result.get("is_error"))
+    return bool(getattr(result, "isError", False) or getattr(result, "is_error", False))
+
+
+def _mcp_text_content(result: Any) -> str:
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        content = result.get("content")
+    else:
+        content = getattr(result, "content", None)
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+                continue
+            text = getattr(item, "text", None)
+            if text is None and isinstance(item, dict):
+                text = item.get("text")
+            if text is not None:
+                parts.append(str(text))
+        return "\n".join(parts)
+    return str(content)
+
+
+def _parse_mcp_json_result(result: Any) -> Any:
+    structured = _mcp_structured_content(result)
+    if isinstance(structured, (dict, list)):
+        return structured
+    text = _mcp_text_content(result).strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        return None
+
+
+def _format_process_result(payload: Dict[str, Any]) -> str:
+    stdout = str(payload.get("stdout") or "")
+    stderr = str(payload.get("stderr") or "")
+    exit_code = payload.get("exit_code")
+    if exit_code in (0, "0") and not stderr:
+        return stdout.rstrip("\n")
+
+    parts: List[str] = []
+    if stdout:
+        parts.append(stdout.rstrip("\n"))
+    if stderr:
+        parts.append(f"[stderr] {stderr.rstrip()}")
+    if exit_code is not None:
+        parts.append(f"[exit={exit_code}]")
+    return "\n".join(part for part in parts if part)
+
+
+def _normalize_mcp_result(result: Any, tool_name: str = "") -> str:
+    if _mcp_is_error(result):
+        text = _mcp_text_content(result)
+        return f"MCP 工具返回错误: {text}" if text else "MCP 工具返回错误"
+
+    parsed = _parse_mcp_json_result(result)
+    if isinstance(parsed, dict):
+        if tool_name == "read_file" and "content" in parsed:
+            return str(parsed.get("content") or "")
+        if tool_name in {"execute_code", "run_command"} and (
+            "stdout" in parsed or "stderr" in parsed or "exit_code" in parsed
+        ):
+            return _format_process_result(parsed)
+        if tool_name == "write_file" and parsed.get("success") is True:
+            return "写入成功"
+        if tool_name == "destroy_sandbox" and parsed.get("success") is True:
+            return "销毁成功"
+        return json.dumps(parsed, ensure_ascii=False)
+    if isinstance(parsed, list):
+        return json.dumps(parsed, ensure_ascii=False)
+
+    text = _mcp_text_content(result)
+    if text:
+        return text
+    structured = _mcp_structured_content(result)
+    if structured is not None:
+        return json.dumps(structured, ensure_ascii=False)
+    if result is None:
+        return ""
+    return str(result)
+
+
+def _mcp_failure_detail(parsed: Dict[str, Any]) -> str:
+    for key in ("error", "message", "detail"):
+        value = parsed.get(key)
+        if value:
+            return str(value)
+    return json.dumps(parsed, ensure_ascii=False)
+
+
+def _is_zero_exit_code(value: Any) -> bool:
+    if value in (0, "0", None):
+        return True
+    try:
+        return int(value) == 0
+    except (TypeError, ValueError):
+        return False
+
+
+def _raise_for_mcp_failure(result: Any, tool_name: str, fail_on_process_error: bool = False) -> None:
+    """Raise for MCP-level errors and optionally failed process results."""
+    if _mcp_is_error(result):
+        text = _mcp_text_content(result)
+        detail = f": {text}" if text else ""
+        raise SandboxMCPError(f"MCP 工具 {tool_name} 返回错误{detail}")
+
+    parsed = _parse_mcp_json_result(result)
+    if not isinstance(parsed, dict):
+        return
+
+    if tool_name in {"write_file", "destroy_sandbox"}:
+        if parsed.get("success") is False:
+            raise SandboxMCPError(f"MCP 工具 {tool_name} 执行失败: {_mcp_failure_detail(parsed)}")
+        if parsed.get("success") is not True and any(key in parsed for key in ("error", "message", "detail")):
+            raise SandboxMCPError(f"MCP 工具 {tool_name} 执行失败: {_mcp_failure_detail(parsed)}")
+
+    if fail_on_process_error and tool_name in {"execute_code", "run_command"}:
+        exit_code = parsed.get("exit_code")
+        if not _is_zero_exit_code(exit_code):
+            output = _format_process_result(parsed)
+            detail = f": {output}" if output else ""
+            raise SandboxMCPError(f"MCP 工具 {tool_name} 退出码 {exit_code}{detail}")
+
+
+def _extract_sandbox_id(result: Any) -> str:
+    structured = _mcp_structured_content(result)
+    if isinstance(structured, dict):
+        for key in ("sandbox_id", "sandboxId", "id"):
+            value = structured.get(key)
+            if value:
+                return str(value)
+
+    text = _mcp_text_content(result).strip()
+    if text:
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            for key in ("sandbox_id", "sandboxId", "id"):
+                value = parsed.get(key)
+                if value:
+                    return str(value)
+
+    if isinstance(result, dict):
+        for key in ("sandbox_id", "sandboxId", "id"):
+            value = result.get(key)
+            if value:
+                return str(value)
+    return ""
+
+
+def _normalize_sandbox_dir(path: str) -> str:
+    """校验 sandbox 内目录路径。"""
+    path_text = str(path or "").strip()
+    if not path_text:
+        raise SandboxMCPError("sandbox skill_mount_path 不能为空")
+    posix_path = PurePosixPath(path_text)
+    if not posix_path.is_absolute():
+        raise SandboxMCPError("sandbox skill_mount_path 必须是绝对路径")
+    if any(part == ".." for part in posix_path.parts):
+        raise SandboxMCPError("sandbox skill_mount_path 不允许包含 '..'")
+    if str(posix_path) == "/":
+        raise SandboxMCPError("sandbox skill_mount_path 不能是根目录")
+    return str(posix_path)
+
+
+def _join_sandbox_path(root: str, rel_path: str) -> str:
+    root_path = PurePosixPath(_normalize_sandbox_dir(root))
+    rel = PurePosixPath(rel_path)
+    if rel.is_absolute() or any(part == ".." for part in rel.parts):
+        raise SandboxMCPError("sandbox 相对路径不合法")
+    return str(root_path.joinpath(rel))
+
+
+def _resolve_mcp_transport(endpoint_url: str, transport: str) -> str:
+    """Resolve configured MCP transport, auto-detecting Streamable HTTP /mcp URLs."""
+    transport_text = str(transport or "auto").strip().lower().replace("-", "_")
+    parsed_path = urlparse(str(endpoint_url or "")).path.rstrip("/")
+    path_looks_streamable = parsed_path.endswith("/mcp") or parsed_path == "/mcp"
+
+    if transport_text in ("", "auto"):
+        return "streamable_http" if path_looks_streamable else "sse"
+    if transport_text in ("streamable", "streamable_http", "http"):
+        return "streamable_http"
+    if transport_text == "sse":
+        return "streamable_http" if path_looks_streamable else "sse"
+    raise SandboxMCPError(f"不支持的 sandbox transport: {transport}")
+
+
+def _sandbox_setup_message() -> str:
+    return (
+        "Sandbox 未配置：此 skill 需要 sandbox runtime capability 或 script tool。\n"
+        "请在插件配置中设置 sandbox.endpoint_url，例如 http://localhost:18080/mcp，"
+        "确认 sandbox MCP 服务已启动后执行 /skill reload 或重启 bot。"
+    )
+
+
+def _collect_skill_sync_files(skill: SkillDefinition, max_size_kb: int) -> List[Dict[str, str]]:
+    """收集当前 skill 下普通文件，跳过 symlink，返回 sandbox 同步载荷。"""
+    root = skill.skill_path.resolve()
+    max_bytes = max_size_kb * 1024
+    total = 0
+    files: List[Dict[str, str]] = []
+
+    for path in sorted(root.rglob("*")):
+        try:
+            if path.is_symlink():
+                logger.warning(f"跳过 skill symlink: {path}")
+                continue
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            if not _is_path_allowed(resolved, [root]):
+                logger.warning(f"跳过 skill 目录外文件: {path}")
+                continue
+            rel = resolved.relative_to(root).as_posix()
+            if rel.startswith("../") or rel == "..":
+                logger.warning(f"跳过非法 skill 相对路径: {path}")
+                continue
+            data = path.read_bytes()
+        except Exception as exc:
+            raise SandboxMCPError(f"读取 skill 文件失败 {path}: {exc}") from exc
+
+        total += len(data)
+        if total > max_bytes:
+            raise SandboxMCPError(f"skill 目录超过同步上限 {max_size_kb}KB")
+        files.append({
+            "path": rel,
+            "content_b64": base64.b64encode(data).decode("ascii"),
+        })
+    return files
+
+
+class MCPSandboxClient:
+    """HTTP MCP sandbox client."""
+
+    def __init__(self, cfg: SandboxConfig):
+        self.cfg = cfg
+        self._transport_cm: Any = None
+        self._session_cm: Any = None
+        self._session: Any = None
+        self._transport_entered = False
+        self._session_entered = False
+
+    async def __aenter__(self) -> "MCPSandboxClient":
+        if not self.cfg.endpoint_url:
+            raise SandboxMCPError("未配置 sandbox.endpoint_url")
+        transport = _resolve_mcp_transport(self.cfg.endpoint_url, self.cfg.transport)
+        try:
+            from mcp import ClientSession
+            from mcp.client.sse import sse_client
+            from mcp.client.streamable_http import streamablehttp_client
+        except ImportError as exc:
+            raise SandboxMCPError("缺少 mcp 依赖，请在插件依赖中安装 mcp>=1.27,<2") from exc
+
+        try:
+            if transport == "sse":
+                self._transport_cm = sse_client(
+                    self.cfg.endpoint_url,
+                    timeout=self.cfg.request_timeout,
+                    sse_read_timeout=self.cfg.sse_read_timeout,
+                )
+            elif transport == "streamable_http":
+                self._transport_cm = streamablehttp_client(
+                    self.cfg.endpoint_url,
+                    timeout=self.cfg.request_timeout,
+                    sse_read_timeout=self.cfg.sse_read_timeout,
+                )
+            else:
+                raise SandboxMCPError(f"不支持的 sandbox transport: {self.cfg.transport}")
+
+            transport_result = await self._transport_cm.__aenter__()
+            read_stream, write_stream = transport_result[0], transport_result[1]
+            self._transport_entered = True
+            self._session_cm = ClientSession(read_stream, write_stream)
+            self._session = await self._session_cm.__aenter__()
+            self._session_entered = True
+            await asyncio.wait_for(self._session.initialize(), timeout=self.cfg.request_timeout)
+            return self
+        except Exception as exc:
+            await self.__aexit__(None, None, None)
+            raise SandboxMCPError(f"连接 sandbox MCP 失败: {exc}") from exc
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            if self._session_cm is not None and self._session_entered:
+                await self._session_cm.__aexit__(exc_type, exc, tb)
+        finally:
+            self._session_entered = False
+            if self._transport_cm is not None and self._transport_entered:
+                await self._transport_cm.__aexit__(exc_type, exc, tb)
+            self._transport_entered = False
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        if self._session is None:
+            raise SandboxMCPError("MCP session 尚未初始化")
+        try:
+            return await asyncio.wait_for(
+                self._session.call_tool(name, arguments),
+                timeout=self.cfg.request_timeout,
+            )
+        except Exception as exc:
+            raise SandboxMCPError(f"MCP 工具 {name} 调用失败: {exc}") from exc
+
+
+class SandboxRuntime:
+    """Per-skill-call sandbox lifecycle wrapper."""
+
+    def __init__(self, cfg: SandboxConfig, client: Optional[Any] = None):
+        self.cfg = cfg
+        self._client = client or MCPSandboxClient(cfg)
+        self.sandbox_id = ""
+
+    async def __aenter__(self) -> "SandboxRuntime":
+        try:
+            self._client = await self._client.__aenter__()
+            result = await self._client.call_tool("create_sandbox", {})
+            if _mcp_is_error(result):
+                text = _mcp_text_content(result)
+                detail = f": {text}" if text else ""
+                raise SandboxMCPError(f"create_sandbox 返回错误{detail}")
+            sandbox_id = _extract_sandbox_id(result)
+            if not sandbox_id:
+                raise SandboxMCPError("create_sandbox 未返回 sandbox id")
+            self.sandbox_id = sandbox_id
+            return self
+        except Exception:
+            await self._client.__aexit__(None, None, None)
+            raise
+
+    async def __aexit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        try:
+            if self.sandbox_id:
+                await self._client.call_tool("destroy_sandbox", {"sandbox_id": self.sandbox_id})
+        finally:
+            await self._client.__aexit__(exc_type, exc, tb)
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> str:
+        payload = {"sandbox_id": self.sandbox_id, **arguments}
+        result = await self._client.call_tool(name, payload)
+        return _normalize_mcp_result(result, name)
+
+    async def call_tool_checked(
+        self,
+        name: str,
+        arguments: Dict[str, Any],
+        *,
+        fail_on_process_error: bool = False,
+    ) -> str:
+        payload = {"sandbox_id": self.sandbox_id, **arguments}
+        result = await self._client.call_tool(name, payload)
+        _raise_for_mcp_failure(result, name, fail_on_process_error=fail_on_process_error)
+        return _normalize_mcp_result(result, name)
+
+    def skill_path(self, rel_path: str = "") -> str:
+        return _join_sandbox_path(self.cfg.skill_mount_path, rel_path)
+
+    async def sync_skill(self, skill: SkillDefinition) -> str:
+        files = _collect_skill_sync_files(skill, self.cfg.skill_sync_max_size_kb)
+        target_dir = _normalize_sandbox_dir(self.cfg.skill_mount_path)
+        if target_dir == _normalize_sandbox_dir(self.cfg.workdir):
+            raise SandboxMCPError("sandbox skill_mount_path 不能等于 workdir")
+        payload = {
+            "target_dir": target_dir,
+            "files": files,
+        }
+        payload_text = json.dumps(payload, ensure_ascii=False)
+        code = "\n".join(
+            [
+                "import base64, json, pathlib, shutil",
+                f"payload = json.loads({json.dumps(payload_text, ensure_ascii=False)})",
+                "target = pathlib.PurePosixPath(payload['target_dir'])",
+                "if not target.is_absolute() or '..' in target.parts:",
+                "    raise ValueError('invalid target_dir')",
+                "root = pathlib.Path(str(target))",
+                "if root.exists():",
+                "    shutil.rmtree(root)",
+                "root.mkdir(parents=True, exist_ok=True)",
+                "for item in payload['files']:",
+                "    rel = pathlib.PurePosixPath(item['path'])",
+                "    if rel.is_absolute() or '..' in rel.parts:",
+                "        raise ValueError('invalid relative path')",
+                "    dest = root.joinpath(*rel.parts)",
+                "    dest.parent.mkdir(parents=True, exist_ok=True)",
+                "    dest.write_bytes(base64.b64decode(item['content_b64']))",
+                "print(f\"synced {len(payload['files'])} files\")",
+            ]
+        )
+        return await self.call_tool_checked(
+            "execute_code",
+            {"language": "python", "code": code},
+            fail_on_process_error=True,
+        )
+
+
 async def run_capability(
     name: str,
     args: Dict[str, Any],
     cfg: CapabilitiesConfig,
+    sandbox: Optional[SandboxRuntime],
     ctx: Any = None,
     stream_id: str = "",
-    plugin_dir: Optional[Path] = None,
-    read_extra_roots: Optional[List[Path]] = None,
 ) -> str:
-    """执行单个 capability tool。"""
+    """通过 MCP sandbox 执行单个 capability tool。"""
+    if sandbox is None:
+        return "Sandbox 未初始化，无法执行 runtime capability。"
     if name == "bash":
-        return await _cap_bash(args.get("command", ""), cfg, ctx=ctx, stream_id=stream_id, plugin_dir=plugin_dir)
+        command = str(args.get("command", ""))
+        if cfg.bash_require_approval:
+            approved = await _wait_admin_approval(command, cfg, ctx, stream_id)
+            if not approved:
+                return "管理员拒绝执行该命令，或审批超时。"
+        workdir = _normalize_sandbox_dir(sandbox.cfg.workdir)
+        command = f"cd {shlex.quote(workdir)} && {command}"
+        return await sandbox.call_tool(
+            "run_command",
+            {"command": command},
+        )
     elif name == "read":
-        return await _cap_read_file(
-            args.get("path", ""),
-            cfg,
-            _coerce_max_lines(args.get("max_lines", 200)),
-            plugin_dir=plugin_dir,
-            read_extra_roots=read_extra_roots,
-        )
+        try:
+            content = await sandbox.call_tool_checked("read_file", {"path": str(args.get("path", ""))})
+        except SandboxMCPError as exc:
+            return f"读取失败: {exc}"
+        lines = content.splitlines()
+        max_lines = _coerce_max_lines(args.get("max_lines", 200))
+        if len(lines) > max_lines:
+            return "\n".join(lines[:max_lines]) + f"\n... (截断，共 {len(lines)} 行)"
+        return content
     elif name == "write":
-        return await _cap_write_file(args.get("path", ""), args.get("content", ""), cfg, plugin_dir=plugin_dir)
+        content = str(args.get("content", ""))
+        if len(content.encode()) > cfg.write_max_size_kb * 1024:
+            return f"内容超过 {cfg.write_max_size_kb}KB 限制"
+        try:
+            return await sandbox.call_tool_checked(
+                "write_file",
+                {"path": str(args.get("path", "")), "content": content},
+            )
+        except SandboxMCPError as exc:
+            return f"写入失败: {exc}"
     elif name == "edit":
-        return await _cap_edit_file(
-            args.get("path", ""),
-            args.get("old_str", ""),
-            args.get("new_str", ""),
-            cfg,
-            plugin_dir=plugin_dir,
-        )
+        path = str(args.get("path", ""))
+        old_str = str(args.get("old_str", ""))
+        new_str = str(args.get("new_str", ""))
+        if not old_str:
+            return "old_str 不能为空"
+        try:
+            content = await sandbox.call_tool_checked("read_file", {"path": path})
+        except SandboxMCPError as exc:
+            return f"读取失败: {exc}"
+        if old_str not in content:
+            return "未找到要替换的内容"
+        count = content.count(old_str)
+        new_content = content.replace(old_str, new_str)
+        if len(new_content.encode()) > cfg.write_max_size_kb * 1024:
+            return f"内容超过 {cfg.write_max_size_kb}KB 限制"
+        try:
+            await sandbox.call_tool_checked("write_file", {"path": path, "content": new_content})
+        except SandboxMCPError as exc:
+            return f"写入失败: {exc}"
+        return f"已替换 {count} 处匹配"
     return f"未知 capability: {name}"
 
 
@@ -605,158 +1024,6 @@ async def _wait_admin_approval(command: str, cfg: CapabilitiesConfig, ctx: Any, 
     return False  # 超时自动拒绝
 
 
-async def _cap_bash(command: str, cfg: CapabilitiesConfig, ctx: Any = None, stream_id: str = "",
-                    plugin_dir: Optional[Path] = None) -> str:
-    # 高危命令直接拒绝
-    for blocked in cfg.bash_blocked_commands:
-        if blocked in command:
-            return f"安全策略阻止: 命令包含 '{blocked}'"
-
-    # 需要管理员审批
-    if cfg.bash_require_approval:
-        approved = await _wait_admin_approval(command, cfg, ctx, stream_id)
-        if not approved:
-            return "管理员拒绝执行该命令，或审批超时。"
-
-    try:
-        if cfg.bash_working_dir:
-            working_dir = cfg.bash_working_dir
-        elif plugin_dir:
-            working_dir = str(plugin_dir)
-        else:
-            working_dir = None
-        proc = await asyncio.create_subprocess_shell(
-            command, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            cwd=working_dir,
-        )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=cfg.bash_timeout)
-        out = stdout.decode("utf-8", errors="replace")[:20000]
-        err = stderr.decode("utf-8", errors="replace")[:5000]
-        parts = []
-        if out:
-            parts.append(out)
-        if err:
-            parts.append(f"[stderr] {err}")
-        parts.append(f"[exit={proc.returncode}]")
-        return "\n".join(parts)
-    except asyncio.TimeoutError:
-        return f"命令超时 ({cfg.bash_timeout}s)"
-    except Exception as e:
-        return f"执行失败: {e}"
-
-
-async def _require_dependency(package_name: str, pip_name: str) -> Optional[str]:
-    """检查依赖是否已安装，缺失时返回错误信息。"""
-    try:
-        __import__(package_name)
-        return None
-    except ImportError:
-        return f"缺少 {pip_name} 依赖，请在插件 manifest 中声明并由依赖流水线安装"
-
-
-async def _cap_read_file(
-    path: str,
-    cfg: CapabilitiesConfig,
-    max_lines: int = 200,
-    plugin_dir: Optional[Path] = None,
-    read_extra_roots: Optional[List[Path]] = None,
-) -> str:
-    raw_fp = Path(path)
-    if raw_fp.is_symlink():
-        return "安全策略阻止: 不允许读取符号链接"
-    fp = raw_fp.resolve()
-    allowed_roots = _resolve_read_roots(cfg.read_allowed_dirs, plugin_dir, read_extra_roots)
-    if not _is_path_allowed(fp, allowed_roots):
-        return f"安全策略阻止: {path} 不在白名单目录中"
-    if not fp.exists():
-        return f"文件不存在: {path}"
-
-    suffix = fp.suffix.lower()
-    try:
-        # docx 文件
-        if suffix == ".docx":
-            err = await _require_dependency("docx", "python-docx")
-            if err:
-                return err
-            from docx import Document
-            doc = Document(str(fp))
-            content = "\n".join(p.text for p in doc.paragraphs)
-            if len(content) > 60000:
-                return content[:60000] + f"\n... (截断，共 {len(content)} 字符)"
-            return content
-
-        # pdf 文件
-        if suffix == ".pdf":
-            err = await _require_dependency("pypdf", "pypdf")
-            if err:
-                return err
-            from pypdf import PdfReader
-            reader = PdfReader(str(fp))
-            pages = []
-            for i, page in enumerate(reader.pages, 1):
-                text = page.extract_text() or ""
-                pages.append(f"--- 第 {i} 页 ---\n{text.strip()}")
-            content = "\n\n".join(pages)
-            if len(content) > 60000:
-                return content[:60000] + f"\n... (截断，共 {len(content)} 字符)"
-            return content
-
-        # 纯文本（txt/md 等）
-        lines = fp.read_text(encoding="utf-8", errors="replace").splitlines()
-        if len(lines) > max_lines:
-            return "\n".join(lines[:max_lines]) + f"\n... (截断，共 {len(lines)} 行)"
-        return "\n".join(lines)
-    except Exception as e:
-        return f"读取失败: {e}"
-
-
-async def _cap_write_file(path: str, content: str, cfg: CapabilitiesConfig,
-                          plugin_dir: Optional[Path] = None) -> str:
-    raw_fp = Path(path)
-    if raw_fp.exists() and raw_fp.is_symlink():
-        return "安全策略阻止: 不允许写入符号链接"
-    fp = raw_fp.resolve()
-    allowed_roots = _resolve_write_roots(cfg.write_allowed_dirs, plugin_dir)
-    if not _is_path_allowed(fp, allowed_roots):
-        return f"安全策略阻止: {path} 不在白名单目录中"
-    if len(content.encode()) > cfg.write_max_size_kb * 1024:
-        return f"内容超过 {cfg.write_max_size_kb}KB 限制"
-    try:
-        fp.parent.mkdir(parents=True, exist_ok=True)
-        fp.write_text(content, encoding="utf-8")
-        return f"已写入 {len(content)} 字符到 {path}"
-    except Exception as e:
-        return f"写入失败: {e}"
-
-
-async def _cap_edit_file(path: str, old_str: str, new_str: str, cfg: CapabilitiesConfig,
-                         plugin_dir: Optional[Path] = None) -> str:
-    """查找替换文件内容。"""
-    raw_fp = Path(path)
-    if raw_fp.is_symlink():
-        return "安全策略阻止: 不允许编辑符号链接"
-    fp = raw_fp.resolve()
-    allowed_roots = _resolve_write_roots(cfg.write_allowed_dirs, plugin_dir)
-    if not _is_path_allowed(fp, allowed_roots):
-        return f"安全策略阻止: {path} 不在白名单目录中"
-    if not fp.exists():
-        return f"文件不存在: {path}"
-    if not fp.is_file():
-        return f"不是普通文件: {path}"
-    if not old_str:
-        return "old_str 不能为空"
-    try:
-        content = fp.read_text(encoding="utf-8", errors="replace")
-        if old_str not in content:
-            return "未找到要替换的内容"
-        count = content.count(old_str)
-        new_content = content.replace(old_str, new_str)
-        fp.write_text(new_content, encoding="utf-8")
-        return f"已替换 {count} 处匹配"
-    except Exception as e:
-        return f"编辑失败: {e}"
-
-
 # ====== 多轮会话缓存 ======
 
 
@@ -815,60 +1082,122 @@ class SessionStore:
 # 全局会话存储实例
 _session_store = SessionStore()
 
-# 脚本模块缓存（key: 绝对路径）
-_script_modules: Dict[str, Any] = {}
-
-
 def _clear_script_cache() -> None:
-    """清除脚本模块缓存，reload 后重新加载。"""
-    _script_modules.clear()
+    """兼容旧调用；脚本不再在宿主机 import，因此无需缓存。"""
 
 
-def _load_script_module(script_path: Path) -> Optional[Any]:
-    """加载并缓存 skill 脚本模块。"""
-    cache_key = str(script_path.resolve())
-    cached = _script_modules.get(cache_key)
-    if cached is not None:
-        return cached
+def _extract_script_tool_schema(script_path: Path) -> Optional[Dict[str, Any]]:
+    """静态读取脚本 TOOL_SCHEMA，避免在宿主机执行 skill 代码。"""
     try:
-        module_name = f"skill_script_{script_path.stem}_{abs(hash(cache_key))}"
-        spec = importlib.util.spec_from_file_location(module_name, script_path)
-        if spec is None or spec.loader is None:
+        source = script_path.read_text(encoding="utf-8")
+        tree = ast.parse(source, filename=str(script_path))
+    except Exception as exc:
+        logger.warning(f"解析脚本失败 {script_path}: {exc}")
+        return None
+
+    has_run = False
+    schema: Optional[Dict[str, Any]] = None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "run":
+            has_run = True
+
+        schema_node: Optional[ast.AST] = None
+        if isinstance(node, ast.Assign):
+            if any(isinstance(target, ast.Name) and target.id == "TOOL_SCHEMA" for target in node.targets):
+                schema_node = node.value
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and node.target.id == "TOOL_SCHEMA" and node.value is not None:
+                schema_node = node.value
+
+        if schema_node is None:
+            continue
+        try:
+            schema_value = ast.literal_eval(schema_node)
+        except Exception as exc:
+            logger.warning(f"脚本 TOOL_SCHEMA 不是静态字面量 {script_path}: {exc}")
             return None
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        _script_modules[cache_key] = module
-        return module
-    except Exception as e:
-        logger.warning(f"加载脚本失败 {script_path}: {e}")
-        return None
+        if isinstance(schema_value, dict):
+            schema = schema_value
 
-
-def _load_script_fn(script_path: Path) -> Optional[Any]:
-    """加载脚本的 run 函数。"""
-    module = _load_script_module(script_path)
-    if module is None:
+    if not has_run:
         return None
-    return getattr(module, "run", None)
+    if schema is not None:
+        return schema
+    return {"type": "function", "function": {
+        "name": script_path.stem,
+        "description": f"执行 {script_path.stem}",
+        "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "输入"}}}
+    }}
 
 
 def _build_script_tools(skill: SkillDefinition) -> List[Dict[str, Any]]:
     """从 scripts 构建 tool schema。"""
     tools = []
-    for name, path in skill.scripts.items():
-        module = _load_script_module(path)
-        if module is None:
-            continue
-        schema = getattr(module, "TOOL_SCHEMA", None)
+    for path in skill.scripts.values():
+        schema = _extract_script_tool_schema(path)
         if isinstance(schema, dict):
             tools.append(schema)
-        elif hasattr(module, "run"):
-            tools.append({"type": "function", "function": {
-                "name": name,
-                "description": (getattr(module, "__doc__", None) or f"执行 {name}").strip(),
-                "parameters": {"type": "object", "properties": {"input": {"type": "string", "description": "输入"}}}
-            }})
     return tools
+
+
+async def run_script_tool_in_sandbox(
+    skill: SkillDefinition,
+    script_path: Path,
+    args: Dict[str, Any],
+    sandbox: Optional[SandboxRuntime],
+) -> str:
+    """在 MCP sandbox 中执行 skill script 的 run 函数。"""
+    if sandbox is None:
+        return "Sandbox 未初始化，无法执行 script tool。"
+
+    root = skill.skill_path.resolve()
+    resolved = script_path.resolve()
+    if not _is_path_allowed(resolved, [root]):
+        return "安全策略阻止: script 不在当前 skill 目录中"
+    if script_path.is_symlink():
+        return "安全策略阻止: 不允许执行符号链接 script"
+    rel_path = resolved.relative_to(root).as_posix()
+    sandbox_script_path = sandbox.skill_path(rel_path)
+
+    args_json = json.dumps(args, ensure_ascii=False)
+    wrapper = "\n".join(
+        [
+            "import asyncio, inspect, json, os, runpy, sys",
+            f"__script_path = {json.dumps(sandbox_script_path, ensure_ascii=False)}",
+            f"__args = json.loads({json.dumps(args_json, ensure_ascii=False)})",
+            "__script_dir = os.path.dirname(__script_path)",
+            "sys.path.insert(0, __script_dir)",
+            "os.chdir(__script_dir)",
+            "__globals = runpy.run_path(__script_path)",
+            "run = __globals.get('run')",
+            "if run is None:",
+            "    raise RuntimeError('script has no run function')",
+            "__sig = inspect.signature(run)",
+            "try:",
+            "    __sig.bind(**__args)",
+            "    __call_mode = 'kwargs'",
+            "except TypeError as __bind_error:",
+            "    if set(__args.keys()) == {'input'}:",
+            "        try:",
+            "            __sig.bind(__args['input'])",
+            "            __call_mode = 'input_positional'",
+            "        except TypeError:",
+            "            raise __bind_error",
+            "    else:",
+            "        raise",
+            "if __call_mode == 'input_positional':",
+            "    __result = run(__args['input'])",
+            "else:",
+            "    __result = run(**__args)",
+            "if inspect.isawaitable(__result):",
+            "    __result = asyncio.run(__result)",
+            "print(str(__result))",
+        ]
+    )
+    return await sandbox.call_tool(
+        "execute_code",
+        {"language": "python", "code": wrapper},
+    )
 
 
 def _estimate_tokens(text: str) -> int:
@@ -908,31 +1237,31 @@ async def run_agent_loop(
     chat_context: str = "", stream_id: str = "", plugin_dir: Optional[Path] = None,
     skills_dir: Optional[Path] = None,
     grant_store: Optional[SkillCapGrantStore] = None,
+    sandbox_client: Optional[Any] = None,
 ) -> str:
     """执行 agent 模式 skill。"""
     model = skill.model or config.default_model
     max_turns = skill.max_turns or config.default_max_turns
     max_tokens = config.agent_max_context_tokens
     cap_cfg = config.capabilities
-    read_extra_roots: List[Path] = [skill.skill_path]
-    if skills_dir is not None:
-        read_extra_roots.append(skills_dir)
 
-    # 构建 tools = scripts + allowed capabilities
-    tools = _build_script_tools(skill)
     allowed_caps = get_allowed_caps(skill, cap_cfg, grant_store)
     denied_caps = [c for c in skill.capabilities if c not in allowed_caps]
+    sandbox_available = sandbox_client is not None or bool(str(config.sandbox.endpoint_url or "").strip())
+
+    # 构建 tools = scripts + allowed sandbox capabilities
+    script_paths: Dict[str, Path] = dict(skill.scripts) if sandbox_available else {}
+    tools = _build_script_tools(skill) if script_paths else []
     for cap in allowed_caps:
         if cap in CAPABILITY_SCHEMAS:
             tools.append(CAPABILITY_SCHEMAS[cap])
     cap_names = set(allowed_caps)
 
-    # 加载脚本函数
-    script_fns: Dict[str, Any] = {}
-    for sname, spath in skill.scripts.items():
-        fn = _load_script_fn(spath)
-        if fn:
-            script_fns[sname] = fn
+    # script tools 也在 sandbox 中执行，宿主机只保留脚本路径。
+    needs_sandbox = bool(cap_names or script_paths)
+
+    if cap_names and not sandbox_available:
+        return _sandbox_setup_message()
 
     # System prompt + 权限提示 + 资源目录提示
     system_content = skill.instructions
@@ -952,10 +1281,15 @@ async def run_agent_loop(
             resource_hints.append(f"资源文件目录 (assets/): {', '.join(assets)}")
     if resource_hints:
         system_content += "\n\n[可用资源]\n" + "\n".join(resource_hints)
-        system_content += f"\n使用 read 工具读取，路径前缀: {skill.skill_path}/"
+        system_content += (
+            f"\n当前 skill 目录已同步到 sandbox: {config.sandbox.skill_mount_path}"
+            f"\n使用 read 工具读取这些资源，例如 {config.sandbox.skill_mount_path}/references/<file>。"
+        )
 
     if denied_caps:
         system_content += f"\n\n[系统提示] 以下能力因权限未开启不可用: {', '.join(denied_caps)}。请在不使用它们的前提下完成任务。"
+    if skill.scripts and not sandbox_available:
+        system_content += "\n\n[系统提示] sandbox 未配置，scripts/ 工具不可用。请直接完成任务，不要尝试调用脚本工具。"
 
     # 构建 user message：聊天上下文 + 任务
     user_content = task
@@ -982,78 +1316,93 @@ async def run_agent_loop(
 
     response_text = ""
     final_result = ""
-    for turn in range(max_turns):
-        # Token 截断
-        messages = _truncate_messages(messages, max_tokens)
+    sandbox_cm: Optional[SandboxRuntime] = None
+    sandbox: Optional[SandboxRuntime] = None
+    sandbox_entered = False
+    try:
+        if needs_sandbox:
+            sandbox_cm = SandboxRuntime(config.sandbox, sandbox_client)
+            sandbox = await sandbox_cm.__aenter__()
+            sandbox_entered = True
+            await sandbox.sync_skill(skill)
 
-        try:
-            if tools:
-                result = await ctx.llm.generate_with_tools(prompt=messages, tools=tools, model=model)
-            else:
-                result = await ctx.llm.generate(prompt=messages, model=model)
-        except Exception as e:
-            final_result = f"Agent LLM 调用失败: {e}"
-            break
+        for turn in range(max_turns):
+            # Token 截断
+            messages = _truncate_messages(messages, max_tokens)
 
-        if not result.get("success", False):
-            error = result.get("error", "未知错误")
-            if turn > 0 and response_text:
-                final_result = response_text + f"\n\n[Agent 在第 {turn+1} 轮遇到错误: {error}]"
-            else:
-                final_result = f"Agent 调用失败: {error}"
-            break
-
-        response_text = result.get("response", "")
-        tool_calls = result.get("tool_calls", [])
-
-        if not tool_calls:
-            final_result = response_text
-            break
-
-        messages.append({"role": "assistant", "content": response_text, "tool_calls": [
-            {"id": tc.get("id", ""), "type": "function", "function": tc.get("function", {})}
-            for tc in tool_calls
-        ]})
-
-        for tc in tool_calls:
-            fn_name = tc.get("function", {}).get("name", "")
-            fn_args_raw = tc.get("function", {}).get("arguments", "{}")
-            tc_id = tc.get("id", "")
             try:
-                fn_args = json.loads(fn_args_raw) if isinstance(fn_args_raw, str) else (fn_args_raw or {})
-            except (json.JSONDecodeError, TypeError):
-                fn_args = {}
+                if tools:
+                    result = await ctx.llm.generate_with_tools(prompt=messages, tools=tools, model=model)
+                else:
+                    result = await ctx.llm.generate(prompt=messages, model=model)
+            except Exception as e:
+                final_result = f"Agent LLM 调用失败: {e}"
+                break
 
-            # 分发：capability 还是 script
-            if fn_name in cap_names:
-                tool_result = await run_capability(
-                    fn_name,
-                    fn_args,
-                    cap_cfg,
-                    ctx=ctx,
-                    stream_id=stream_id,
-                    plugin_dir=plugin_dir,
-                    read_extra_roots=read_extra_roots,
-                )
-            elif fn_name in script_fns:
+            if not result.get("success", False):
+                error = result.get("error", "未知错误")
+                if turn > 0 and response_text:
+                    final_result = response_text + f"\n\n[Agent 在第 {turn+1} 轮遇到错误: {error}]"
+                else:
+                    final_result = f"Agent 调用失败: {error}"
+                break
+
+            response_text = result.get("response", "")
+            tool_calls = result.get("tool_calls", [])
+
+            if not tool_calls:
+                final_result = response_text
+                break
+
+            messages.append({"role": "assistant", "content": response_text, "tool_calls": [
+                {"id": tc.get("id", ""), "type": "function", "function": tc.get("function", {})}
+                for tc in tool_calls
+            ]})
+
+            for tc in tool_calls:
+                fn_name = tc.get("function", {}).get("name", "")
+                fn_args_raw = tc.get("function", {}).get("arguments", "{}")
+                tc_id = tc.get("id", "")
                 try:
-                    fn = script_fns[fn_name]
-                    if asyncio.iscoroutinefunction(fn):
-                        tool_result = str(await fn(**fn_args))
-                    else:
-                        tool_result = str(await asyncio.to_thread(fn, **fn_args))
-                except Exception as e:
-                    tool_result = f"脚本执行错误: {e}"
-            else:
-                tool_result = f"未知工具: {fn_name}"
+                    fn_args = json.loads(fn_args_raw) if isinstance(fn_args_raw, str) else (fn_args_raw or {})
+                except (json.JSONDecodeError, TypeError):
+                    fn_args = {}
 
-            # 截断过长的 tool 结果
-            if len(tool_result) > 10000:
-                tool_result = tool_result[:10000] + "\n... (结果已截断)"
+                # 分发：sandbox capability 还是 sandbox script
+                if fn_name in cap_names:
+                    tool_result = await run_capability(
+                        fn_name,
+                        fn_args,
+                        cap_cfg,
+                        sandbox,
+                        ctx=ctx,
+                        stream_id=stream_id,
+                    )
+                elif fn_name in script_paths:
+                    tool_result = await run_script_tool_in_sandbox(
+                        skill,
+                        script_paths[fn_name],
+                        fn_args,
+                        sandbox,
+                    )
+                else:
+                    tool_result = f"未知工具: {fn_name}"
 
-            messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
-    else:
-        final_result = response_text or f"Agent 达到最大轮数 ({max_turns})"
+                # 截断过长的 tool 结果
+                if len(tool_result) > 10000:
+                    tool_result = tool_result[:10000] + "\n... (结果已截断)"
+
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
+        else:
+            final_result = response_text or f"Agent 达到最大轮数 ({max_turns})"
+    except SandboxMCPError as e:
+        final_result = f"Sandbox 执行失败: {e}"
+    finally:
+        if sandbox_cm is not None and sandbox_entered:
+            try:
+                await sandbox_cm.__aexit__(None, None, None)
+            except Exception as e:
+                logger.warning(f"销毁 sandbox 失败: {e}")
 
     # 保存多轮会话
     if config.session_enabled and stream_id:
@@ -1063,22 +1412,6 @@ async def run_agent_loop(
         _session_store.save(stream_id, skill.name, messages, config.session_max_history)
 
     return final_result
-
-
-async def run_direct_skill(skill: SkillDefinition, task: str) -> str:
-    """执行 direct 模式 skill。"""
-    if not skill.scripts:
-        return f"Skill '{skill.name}' 没有可执行脚本"
-    entry = list(skill.scripts.values())[0]
-    fn = _load_script_fn(entry)
-    if fn is None:
-        return f"无法加载脚本: {entry.name}"
-    try:
-        if asyncio.iscoroutinefunction(fn):
-            return str(await fn(task))
-        return str(await asyncio.to_thread(fn, task))
-    except Exception as e:
-        return f"执行失败: {e}\n{traceback.format_exc()}"
 
 
 def _strip_markdown(text: str) -> str:
@@ -1291,25 +1624,21 @@ class SkillLoaderPlugin(MaiBotPlugin):
             return {"name": skill.name, "content": f"{skill.name} 正在后台执行中，请稍后再次调用。"}
 
         # 执行 skill（带超时 + shield）
-        if skill.mode == "direct":
-            coro = run_direct_skill(skill, task)
-        else:
-            # 获取聊天上下文注入给 agent
-            chat_context = ""
-            if stream_id:
-                chat_context = await self._get_chat_context(stream_id)
-            skills_dir = Path(self._last_loaded_skills_dir) if self._last_loaded_skills_dir else None
-            coro = run_agent_loop(
-                skill,
-                task,
-                self.ctx,
-                self.config,
-                chat_context=chat_context,
-                stream_id=stream_id,
-                plugin_dir=Path(__file__).parent,
-                skills_dir=skills_dir,
-                grant_store=self._cap_grants,
-            )
+        chat_context = ""
+        if stream_id:
+            chat_context = await self._get_chat_context(stream_id)
+        skills_dir = Path(self._last_loaded_skills_dir) if self._last_loaded_skills_dir else None
+        coro = run_agent_loop(
+            skill,
+            task,
+            self.ctx,
+            self.config,
+            chat_context=chat_context,
+            stream_id=stream_id,
+            plugin_dir=Path(__file__).parent,
+            skills_dir=skills_dir,
+            grant_store=self._cap_grants,
+        )
 
         real_task = asyncio.ensure_future(coro)
         try:

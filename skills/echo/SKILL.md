@@ -2,7 +2,8 @@
 name: echo
 description: 简单的回声测试工具，原样返回输入内容，用于验证 skill 系统是否正常工作。
 metadata:
-  maibot-mode: direct
+  maibot-mode: agent
+  maibot-max-turns: "2"
 ---
 
 ## 使用说明
