@@ -1302,6 +1302,26 @@ def _llm_model_diagnostic_note(requested_model: str, available_models: List[str]
     return f"\n\n[LLM 模型诊断] 请求模型: {requested_model}; MaiBot 可用模型: <unavailable>"
 
 
+async def _log_selected_llm_model(ctx: Any, skill_name: str, model: str) -> None:
+    if not model:
+        return
+    names = await _read_llm_model_listing(ctx)
+    if names:
+        message = (
+            f"MaiBot LLM 模型选择: skill={skill_name} requested={model!r} "
+            f"available_models={', '.join(names)}"
+        )
+    else:
+        message = f"MaiBot LLM 模型选择: skill={skill_name} requested={model!r} available_models=<unavailable>"
+    logger.warning(message)
+    ctx_logger = getattr(ctx, "logger", None)
+    if ctx_logger is not None and ctx_logger is not logger:
+        try:
+            ctx_logger.warning(message)
+        except Exception as exc:
+            logger.debug(f"写入 ctx.logger 失败: {exc}")
+
+
 async def _generate_with_model_diagnostics(
     ctx: Any,
     messages: List[Dict[str, Any]],
@@ -1358,6 +1378,8 @@ async def run_agent_loop(
 
     if cap_names and not sandbox_available:
         return _sandbox_setup_message()
+
+    await _log_selected_llm_model(ctx, skill.name, model)
 
     # System prompt + 权限提示 + 资源目录提示
     system_content = skill.instructions

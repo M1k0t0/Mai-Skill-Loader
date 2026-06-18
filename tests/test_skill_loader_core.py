@@ -911,8 +911,9 @@ class TestAgentLoop:
         assert "Agent LLM 调用失败" in result
         assert "MaiBot 可用模型: gemini-pro-agent, fallback-agent" in result
         assert llm.models == ["gemini-pro-agent"]
+        assert "MaiBot LLM 模型选择" in caplog.text
         assert "available_models=gemini-pro-agent, fallback-agent" in caplog.text
-        ctx_logger.warning.assert_called_once()
+        assert ctx_logger.warning.call_count == 2
 
     @pytest.mark.asyncio
     async def test_run_agent_loop_destroys_sandbox_on_llm_error(self, plugin_module, tmp_path: Path) -> None:
