@@ -909,7 +909,7 @@ class TestAgentLoop:
             )
 
         assert "Agent LLM 调用失败" in result
-        assert "MaiBot 可用模型: gemini-pro-agent, fallback-agent" in result
+        assert "MaiBot 可用模型" not in result
         assert llm.models == ["gemini-pro-agent"]
         assert "MaiBot LLM 模型选择" in caplog.text
         assert "available_models=gemini-pro-agent, fallback-agent" in caplog.text

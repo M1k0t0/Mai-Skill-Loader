@@ -1293,15 +1293,6 @@ async def _log_llm_model_list(ctx: Any, requested_model: str, error: Any) -> Non
             logger.debug(f"写入 ctx.logger 失败: {exc}")
 
 
-def _llm_model_diagnostic_note(requested_model: str, available_models: List[str]) -> str:
-    if available_models:
-        return (
-            f"\n\n[LLM 模型诊断] 请求模型: {requested_model}; "
-            f"MaiBot 可用模型: {', '.join(available_models)}"
-        )
-    return f"\n\n[LLM 模型诊断] 请求模型: {requested_model}; MaiBot 可用模型: <unavailable>"
-
-
 async def _log_selected_llm_model(ctx: Any, skill_name: str, model: str) -> None:
     if not model:
         return
@@ -1452,8 +1443,6 @@ async def run_agent_loop(
                 result = await _generate_with_model_diagnostics(ctx, messages, tools, model)
             except Exception as e:
                 final_result = f"Agent LLM 调用失败: {e}"
-                if model and _is_missing_model_error(e):
-                    final_result += _llm_model_diagnostic_note(model, await _read_llm_model_listing(ctx))
                 break
 
             if not result.get("success", False):
@@ -1462,8 +1451,6 @@ async def run_agent_loop(
                     final_result = response_text + f"\n\n[Agent 在第 {turn+1} 轮遇到错误: {error}]"
                 else:
                     final_result = f"Agent 调用失败: {error}"
-                if model and _is_missing_model_error(error):
-                    final_result += _llm_model_diagnostic_note(model, await _read_llm_model_listing(ctx))
                 break
 
             response_text = result.get("response", "")
