@@ -959,6 +959,10 @@ def _extract_message_user_id(msg: Any) -> str:
 def _extract_message_text(msg: Any) -> str:
     """从 get_recent 返回的消息中提取纯文本内容。"""
     if not isinstance(msg, dict):
+        for attr in ("processed_plain_text", "plain_text", "text", "content"):
+            value = getattr(msg, attr, None)
+            if value:
+                return str(value).strip()
         return ""
     top_content = str(msg.get("content") or "").strip()
     if top_content:
@@ -976,6 +980,21 @@ def _extract_message_text(msg: Any) -> str:
         elif data is not None:
             parts.append(str(data))
     return "".join(parts).strip()
+
+
+def _format_chat_context(messages: List[Any]) -> str:
+    """将最近消息格式化为可注入 agent 的文本，兼容 dict 与消息对象。"""
+    lines: List[str] = []
+    for msg in messages:
+        text = _extract_message_text(msg)
+        if not text:
+            continue
+        user_id = _extract_message_user_id(msg)
+        if not user_id and not isinstance(msg, dict):
+            user_id = str(getattr(msg, "user_id", "") or "").strip()
+        prefix = f"{user_id}: " if user_id else ""
+        lines.append(f"{prefix}{text}")
+    return "\n".join(lines)
 
 
 async def _wait_admin_approval(command: str, cfg: CapabilitiesConfig, ctx: Any, stream_id: str) -> bool:
@@ -1229,6 +1248,128 @@ def _truncate_messages(messages: List[Dict[str, Any]], max_tokens: int) -> List[
     return system_msgs + kept
 
 
+def _is_missing_model_error(error: Any) -> bool:
+    text = str(error or "")
+    return "未找到名为" in text and "模型配置" in text
+
+
+def _extract_model_names_from_listing(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, dict):
+        for key in ("name", "model", "model_name", "id", "key"):
+            item_value = value.get(key)
+            if item_value:
+                return [str(item_value)]
+        for key in ("models", "model_list", "model_configs", "configs", "data"):
+            if key in value:
+                names = _extract_model_names_from_listing(value.get(key))
+                if names:
+                    return names
+        return [str(key) for key in value.keys() if str(key)]
+    if isinstance(value, (list, tuple, set)):
+        names: List[str] = []
+        for item in value:
+            names.extend(_extract_model_names_from_listing(item))
+        return names
+    if isinstance(value, (int, float, bool)):
+        return []
+
+    for attr in ("name", "model", "model_name", "id", "key"):
+        attr_value = getattr(value, attr, None)
+        if attr_value:
+            return [str(attr_value)]
+    return []
+
+
+async def _read_llm_model_listing(ctx: Any) -> tuple[str, List[str]]:
+    llm = getattr(ctx, "llm", None)
+    if llm is None:
+        return "ctx.llm", []
+
+    for attr in (
+        "list_models",
+        "get_models",
+        "models",
+        "list_model_configs",
+        "get_model_configs",
+        "model_configs",
+        "available_models",
+    ):
+        if not hasattr(llm, attr):
+            continue
+        source = getattr(llm, attr)
+        try:
+            value = source() if callable(source) else source
+            if asyncio.iscoroutine(value):
+                value = await value
+        except TypeError:
+            continue
+        except Exception as exc:
+            logger.warning(f"读取 MaiBot LLM 模型列表失败 ({attr}): {exc}")
+            continue
+        names = _extract_model_names_from_listing(value)
+        if names:
+            seen: set[str] = set()
+            unique = [name for name in names if not (name in seen or seen.add(name))]
+            return attr, unique
+    return "unknown", []
+
+
+async def _log_llm_model_list(ctx: Any, requested_model: str, error: Any) -> None:
+    source, names = await _read_llm_model_listing(ctx)
+    if names:
+        logger.warning(
+            "MaiBot LLM 模型查找失败: requested=%r error=%s visible_models(%s)=%s",
+            requested_model,
+            error,
+            source,
+            ", ".join(names),
+        )
+        return
+
+    llm = getattr(ctx, "llm", None)
+    attrs = []
+    if llm is not None:
+        attrs = [attr for attr in dir(llm) if not attr.startswith("_")][:50]
+    logger.warning(
+        "MaiBot LLM 模型查找失败: requested=%r error=%s; 未能读取模型列表 source=%s attrs=%s",
+        requested_model,
+        error,
+        source,
+        ", ".join(attrs),
+    )
+
+
+async def _generate_with_model_fallback(
+    ctx: Any,
+    messages: List[Dict[str, Any]],
+    tools: List[Dict[str, Any]],
+    model: str,
+) -> Dict[str, Any]:
+    async def call(selected_model: str) -> Dict[str, Any]:
+        if tools:
+            return await ctx.llm.generate_with_tools(prompt=messages, tools=tools, model=selected_model)
+        return await ctx.llm.generate(prompt=messages, model=selected_model)
+
+    try:
+        result = await call(model)
+    except Exception as exc:
+        if model and _is_missing_model_error(exc):
+            await _log_llm_model_list(ctx, model, exc)
+            logger.warning(f"模型 {model!r} 不存在，回退到系统默认模型")
+            return await call("")
+        raise
+
+    if model and not result.get("success", False) and _is_missing_model_error(result.get("error", "")):
+        await _log_llm_model_list(ctx, model, result.get("error", ""))
+        logger.warning(f"模型 {model!r} 不存在，回退到系统默认模型")
+        return await call("")
+    return result
+
+
 # ====== Agent Loop ======
 
 
@@ -1331,10 +1472,7 @@ async def run_agent_loop(
             messages = _truncate_messages(messages, max_tokens)
 
             try:
-                if tools:
-                    result = await ctx.llm.generate_with_tools(prompt=messages, tools=tools, model=model)
-                else:
-                    result = await ctx.llm.generate(prompt=messages, model=model)
+                result = await _generate_with_model_fallback(ctx, messages, tools, model)
             except Exception as e:
                 final_result = f"Agent LLM 调用失败: {e}"
                 break
@@ -1572,9 +1710,13 @@ class SkillLoaderPlugin(MaiBotPlugin):
             messages = await self.ctx.message.get_recent(stream_id, limit=limit)
             if not messages:
                 return ""
-            readable = await self.ctx.message.build_readable(messages)
-            if readable:
-                return str(readable)
+            local_readable = _format_chat_context(messages)
+            if local_readable:
+                return local_readable
+            if all(not isinstance(message, dict) for message in messages):
+                readable = await self.ctx.message.build_readable(messages)
+                if readable:
+                    return str(readable)
         except Exception as e:
             logger.debug(f"获取聊天上下文失败: {e}")
         return ""

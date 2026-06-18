@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from pathlib import Path
@@ -209,6 +210,28 @@ class TestPerSkillCapabilities:
 
 
 class TestSkillCommands:
+    @pytest.mark.asyncio
+    async def test_get_chat_context_formats_dict_messages_without_build_readable(self, plugin) -> None:
+        plugin._ctx = SimpleNamespace(
+            message=SimpleNamespace(
+                get_recent=AsyncMock(
+                    return_value=[
+                        {
+                            "message_info": {"user_info": {"user_id": "10001"}},
+                            "raw_message": [{"type": "text", "data": "hello"}],
+                        }
+                    ]
+                ),
+                build_readable=AsyncMock(side_effect=AssertionError("should not call build_readable for dicts")),
+            )
+        )
+
+        result = await plugin._get_chat_context("stream-1")
+
+        assert result == "10001: hello"
+        plugin._ctx.message.get_recent.assert_awaited_once_with("stream-1", limit=10)
+        plugin._ctx.message.build_readable.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_handle_skill_command_sends_reply(self, plugin) -> None:
         plugin._ctx = SimpleNamespace(send=SimpleNamespace(text=AsyncMock()))
@@ -838,6 +861,79 @@ class TestAgentLoop:
         assert fake_sandbox.exited is True
 
     @pytest.mark.asyncio
+    async def test_run_agent_loop_logs_maibot_model_list_then_falls_back_when_model_missing(
+        self,
+        plugin_module,
+        tmp_path: Path,
+        caplog,
+    ) -> None:
+        skill = plugin_module.SkillDefinition(
+            name="reader",
+            description="read test",
+            mode="agent",
+            model="",
+            max_turns=2,
+            instructions="read file",
+            scripts={},
+            skill_path=tmp_path,
+            capabilities=["read"],
+        )
+        config = plugin_module.SkillLoaderConfig()
+        config.default_model = "gemini-pro-agent"
+        fake_sandbox = FakeSandboxClient({"/workspace/skill/note.txt": "hello"})
+
+        class FakeLLM:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.models: list[str] = []
+
+            async def list_models(self):
+                return [
+                    {"name": "gemini-pro-agent"},
+                    {"name": "fallback-agent"},
+                ]
+
+            async def generate_with_tools(self, prompt, tools, model):
+                self.calls += 1
+                self.models.append(model)
+                if model == "gemini-pro-agent":
+                    raise RuntimeError("未找到名为 `gemini-pro-agent` 的模型配置")
+                if self.calls == 2:
+                    return {
+                        "success": True,
+                        "response": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "function": {
+                                    "name": "read",
+                                    "arguments": '{"path": "/workspace/skill/note.txt"}',
+                                },
+                            }
+                        ],
+                    }
+                return {"success": True, "response": "完成", "tool_calls": []}
+
+        llm = FakeLLM()
+        caplog.set_level(logging.WARNING, logger="skill_loader")
+
+        with caplog.at_level(logging.WARNING, logger="skill_loader"):
+            result = await plugin_module.run_agent_loop(
+                skill,
+                "读取文件",
+                SimpleNamespace(llm=llm),
+                config,
+                plugin_dir=tmp_path,
+                skills_dir=tmp_path,
+                sandbox_client=fake_sandbox,
+            )
+
+        assert result == "完成"
+        assert llm.models == ["gemini-pro-agent", "", "gemini-pro-agent", ""]
+        assert "visible_models(list_models)=gemini-pro-agent, fallback-agent" in caplog.text
+        assert "回退到系统默认模型" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_run_agent_loop_destroys_sandbox_on_llm_error(self, plugin_module, tmp_path: Path) -> None:
         skill = plugin_module.SkillDefinition(
             name="reader",
@@ -959,7 +1055,7 @@ class TestMaiBotToMCPFlow:
         ]
         assert fake_sandbox.calls[2][1]["sandbox_id"] == "sbx-1"
         ctx.message.get_recent.assert_awaited_once_with("stream-e2e-read", limit=10)
-        ctx.message.build_readable.assert_awaited_once()
+        ctx.message.build_readable.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_invoke_component_runs_script_tool_through_mcp(
