@@ -203,6 +203,14 @@ metadata:
 
 `sandbox.endpoint_url` 可以配置为 Streamable HTTP 端点（例如 `http://localhost:18080/mcp`）或 SSE 端点。`sandbox.transport` 默认 `auto`，会对 `/mcp` 自动使用 `streamable_http`，其他路径默认使用 `sse`。
 
+`sandbox.cleanup_policy` 控制 sandbox 容器的自动清理时机：
+
+| 值 | 说明 |
+|------|------|
+| `single_turn` | 每次 skill 调用结束后销毁容器（默认） |
+| `session` | 同一 `stream_id + skill` 复用容器，会话 TTL 过期时销毁 |
+| `never` | 插件不自动销毁容器，只关闭 MCP 连接 |
+
 ## 许可证
 
 MIT

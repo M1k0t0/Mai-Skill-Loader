@@ -34,5 +34,6 @@ transport = "auto"           # auto, sse, streamable_http；/mcp 会自动使用
 workdir = "/workspace"       # sandbox 内默认工作目录
 skill_mount_path = "/workspace/skill" # 当前 skill 同步到 sandbox 内的路径
 skill_sync_max_size_kb = 4096 # 同步单个 skill 目录最大 KB
+cleanup_policy = "single_turn" # 容器自动清理策略: single_turn(单轮), session(会话), never(不自动清理)
 request_timeout = 30.0       # MCP 请求超时（秒）
 sse_read_timeout = 300.0     # SSE/streamable HTTP 读取超时（秒）
