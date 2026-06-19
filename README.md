@@ -208,8 +208,18 @@ metadata:
 | 值 | 说明 |
 |------|------|
 | `single_turn` | 每次 skill 调用结束后销毁容器（默认） |
-| `session` | 同一 `stream_id + skill` 复用容器，会话 TTL 过期时销毁 |
+| `session` | 按 `sandbox.reuse_scope` 复用容器，TTL 过期时销毁 |
 | `never` | 插件不自动销毁容器，只关闭 MCP 连接 |
+
+`sandbox.reuse_scope` 仅在 `cleanup_policy = "session"` 时生效：
+
+| 值 | 说明 |
+|------|------|
+| `skill` | 同一 `stream_id + skill` 复用容器（默认） |
+| `stream` | 同一 `stream_id` 下多个 skill 共享容器，适合交替使用多个 skill |
+
+复用容器每次命中都会刷新 TTL，TTL 使用 `session_ttl_seconds`。
+过期容器会在下一次 skill 调用或入站消息预处理 Hook (`chat.receive.before_process`) 触发时清理。
 
 ## 许可证
 

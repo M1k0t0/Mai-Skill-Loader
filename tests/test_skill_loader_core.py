@@ -210,6 +210,48 @@ class TestPerSkillCapabilities:
 
 
 class TestSkillCommands:
+    def test_get_components_registers_sandbox_janitor_hook(self, plugin) -> None:
+        components = plugin.get_components()
+
+        hook_component = next(
+            item for item in components if item["name"] == "skill_loader_sandbox_janitor"
+        )
+        assert hook_component["type"] == "HOOK_HANDLER"
+        assert hook_component["metadata"]["hook"] == "chat.receive.before_process"
+        assert hook_component["metadata"]["mode"] == "observe"
+        assert hook_component["metadata"]["handler_name"] == "_handle_sandbox_janitor_hook"
+
+    @pytest.mark.asyncio
+    async def test_sandbox_janitor_hook_cleans_expired_session_leases(
+        self,
+        plugin,
+        plugin_module,
+    ) -> None:
+        plugin.config.sandbox.cleanup_policy = "session"
+
+        with patch.object(plugin_module, "_destroy_expired_sandbox_leases", new=AsyncMock()) as cleanup:
+            result = await plugin._handle_sandbox_janitor_hook(message={})
+
+        assert result == {"action": "continue"}
+        cleanup.assert_awaited_once_with(
+            plugin.config.session_ttl_seconds,
+            plugin.config.sandbox,
+        )
+
+    @pytest.mark.asyncio
+    async def test_sandbox_janitor_hook_skips_non_session_policy(
+        self,
+        plugin,
+        plugin_module,
+    ) -> None:
+        plugin.config.sandbox.cleanup_policy = "single_turn"
+
+        with patch.object(plugin_module, "_destroy_expired_sandbox_leases", new=AsyncMock()) as cleanup:
+            result = await plugin._handle_sandbox_janitor_hook(message={})
+
+        assert result == {"action": "continue"}
+        cleanup.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_get_chat_context_formats_dict_messages_without_build_readable(self, plugin) -> None:
         plugin._ctx = SimpleNamespace(
@@ -476,6 +518,11 @@ class TestSandboxTransport:
         assert plugin_module._normalize_sandbox_cleanup_policy("单轮") == "single_turn"
         assert plugin_module._normalize_sandbox_cleanup_policy("会话") == "session"
         assert plugin_module._normalize_sandbox_cleanup_policy("不自动清理") == "never"
+
+    def test_reuse_scope_accepts_aliases(self, plugin_module) -> None:
+        assert plugin_module._normalize_sandbox_reuse_scope("skill") == "skill"
+        assert plugin_module._normalize_sandbox_reuse_scope("stream") == "stream"
+        assert plugin_module._normalize_sandbox_reuse_scope("聊天流") == "stream"
 
 
 class TestSkillSync:
@@ -972,9 +1019,9 @@ class TestAgentLoop:
         config = plugin_module.SkillLoaderConfig()
         config.sandbox.cleanup_policy = "session"
         stream_id = "stream-session-reuse"
-        session_key = plugin_module._session_store.key(stream_id, skill.name)
+        lease_key = plugin_module._sandbox_lease_key(stream_id, skill.name, "skill")
+        plugin_module._sandbox_leases.clear_all()
         plugin_module._session_store.clear(stream_id, skill.name)
-        plugin_module._sandbox_leases.clear(session_key)
         fake_sandbox = FakeSandboxClient({"/workspace/skill/note.txt": "hello"})
         calls = {"count": 0}
 
@@ -1021,6 +1068,163 @@ class TestAgentLoop:
         assert fake_sandbox.calls[4][1]["sandbox_id"] == "sbx-1"
 
     @pytest.mark.asyncio
+    async def test_run_agent_loop_reuses_stream_sandbox_across_skills(
+        self,
+        plugin_module,
+        tmp_path: Path,
+    ) -> None:
+        skill_a_dir = tmp_path / "reader-a"
+        skill_b_dir = tmp_path / "reader-b"
+        skill_a_dir.mkdir()
+        skill_b_dir.mkdir()
+        (skill_a_dir / "note.txt").write_text("a", encoding="utf-8")
+        (skill_b_dir / "note.txt").write_text("b", encoding="utf-8")
+        skill_a = plugin_module.SkillDefinition(
+            name="reader-a",
+            description="read a",
+            mode="agent",
+            model="",
+            max_turns=2,
+            instructions="read file",
+            scripts={},
+            skill_path=skill_a_dir,
+            capabilities=["read"],
+        )
+        skill_b = plugin_module.SkillDefinition(
+            name="reader-b",
+            description="read b",
+            mode="agent",
+            model="",
+            max_turns=2,
+            instructions="read file",
+            scripts={},
+            skill_path=skill_b_dir,
+            capabilities=["read"],
+        )
+        config = plugin_module.SkillLoaderConfig()
+        config.sandbox.cleanup_policy = "session"
+        config.sandbox.reuse_scope = "stream"
+        stream_id = "stream-shared-sandbox"
+        lease_key = plugin_module._sandbox_lease_key(stream_id, skill_a.name, "stream")
+        plugin_module._sandbox_leases.clear_all()
+        plugin_module._session_store.clear(stream_id, skill_a.name)
+        plugin_module._session_store.clear(stream_id, skill_b.name)
+        fake_sandbox = FakeSandboxClient({"/workspace/skill/note.txt": "hello"})
+        calls = {"count": 0}
+
+        class FakeLLM:
+            async def generate_with_tools(self, prompt, tools, model):
+                calls["count"] += 1
+                if calls["count"] in (1, 3):
+                    return {
+                        "success": True,
+                        "response": "",
+                        "tool_calls": [
+                            {
+                                "id": f"tc{calls['count']}",
+                                "function": {
+                                    "name": "read",
+                                    "arguments": '{"path": "/workspace/skill/note.txt"}',
+                                },
+                            }
+                        ],
+                    }
+                return {"success": True, "response": "完成", "tool_calls": []}
+
+        ctx = SimpleNamespace(llm=FakeLLM())
+        for skill in (skill_a, skill_b):
+            result = await plugin_module.run_agent_loop(
+                skill,
+                "读取文件",
+                ctx,
+                config,
+                stream_id=stream_id,
+                plugin_dir=tmp_path,
+                skills_dir=tmp_path,
+                sandbox_client=fake_sandbox,
+            )
+            assert result == "完成"
+
+        assert [name for name, _args in fake_sandbox.calls] == [
+            "create_sandbox",
+            "execute_code",
+            "read_file",
+            "execute_code",
+            "read_file",
+        ]
+        assert fake_sandbox.calls[4][1]["sandbox_id"] == "sbx-1"
+
+    @pytest.mark.asyncio
+    async def test_run_agent_loop_reuse_refreshes_stream_sandbox_ttl(
+        self,
+        plugin_module,
+        tmp_path: Path,
+    ) -> None:
+        (tmp_path / "note.txt").write_text("hello", encoding="utf-8")
+        skill = plugin_module.SkillDefinition(
+            name="reader",
+            description="read test",
+            mode="agent",
+            model="",
+            max_turns=2,
+            instructions="read file",
+            scripts={},
+            skill_path=tmp_path,
+            capabilities=["read"],
+        )
+        config = plugin_module.SkillLoaderConfig()
+        config.sandbox.cleanup_policy = "session"
+        config.sandbox.reuse_scope = "stream"
+        config.session_ttl_seconds = 300
+        stream_id = "stream-refresh-ttl"
+        lease_key = plugin_module._sandbox_lease_key(stream_id, skill.name, "stream")
+        plugin_module._sandbox_leases.clear_all()
+        plugin_module._session_store.clear(stream_id, skill.name)
+        plugin_module._sandbox_leases.save(lease_key, "sbx-1")
+        old_last_active = time.time() - 120
+        plugin_module._sandbox_leases._leases[lease_key]["last_active"] = old_last_active
+        fake_sandbox = FakeSandboxClient({"/workspace/skill/note.txt": "hello"})
+        calls = {"count": 0}
+
+        class FakeLLM:
+            async def generate_with_tools(self, prompt, tools, model):
+                calls["count"] += 1
+                if calls["count"] == 1:
+                    return {
+                        "success": True,
+                        "response": "",
+                        "tool_calls": [
+                            {
+                                "id": "tc1",
+                                "function": {
+                                    "name": "read",
+                                    "arguments": '{"path": "/workspace/skill/note.txt"}',
+                                },
+                            }
+                        ],
+                    }
+                return {"success": True, "response": "完成", "tool_calls": []}
+
+        result = await plugin_module.run_agent_loop(
+            skill,
+            "读取文件",
+            SimpleNamespace(llm=FakeLLM()),
+            config,
+            stream_id=stream_id,
+            plugin_dir=tmp_path,
+            skills_dir=tmp_path,
+            sandbox_client=fake_sandbox,
+        )
+
+        assert result == "完成"
+        assert [name for name, _args in fake_sandbox.calls] == [
+            "execute_code",
+            "read_file",
+        ]
+        assert fake_sandbox.calls[1][1]["sandbox_id"] == "sbx-1"
+        assert plugin_module._sandbox_leases._leases[lease_key]["last_active"] > old_last_active
+
+    @pytest.mark.asyncio
     async def test_run_agent_loop_destroys_expired_session_sandbox(
         self,
         plugin_module,
@@ -1041,9 +1245,9 @@ class TestAgentLoop:
         config = plugin_module.SkillLoaderConfig()
         config.sandbox.cleanup_policy = "session"
         stream_id = "stream-session-expire"
-        session_key = plugin_module._session_store.key(stream_id, skill.name)
+        lease_key = plugin_module._sandbox_lease_key(stream_id, skill.name, "skill")
+        plugin_module._sandbox_leases.clear_all()
         plugin_module._session_store.clear(stream_id, skill.name)
-        plugin_module._sandbox_leases.clear(session_key)
         fake_sandbox = FakeSandboxClient({"/workspace/skill/note.txt": "hello"})
         calls = {"count": 0}
 

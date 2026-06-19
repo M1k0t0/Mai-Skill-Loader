@@ -67,6 +67,10 @@ class SandboxConfig(PluginConfigBase):
         default="single_turn",
         description="sandbox 容器自动清理策略: single_turn(单轮), session(会话), never(不自动清理)",
     )
+    reuse_scope: str = Field(
+        default="skill",
+        description="session 清理策略下的 sandbox 复用范围: skill(同一 skill), stream(同一聊天流)",
+    )
     request_timeout: float = Field(default=30.0, description="MCP 请求超时（秒）")
     sse_read_timeout: float = Field(default=300.0, description="SSE/streamable HTTP 读取超时（秒）")
 
@@ -639,6 +643,8 @@ def _resolve_mcp_transport(endpoint_url: str, transport: str) -> str:
 SANDBOX_CLEANUP_SINGLE_TURN = "single_turn"
 SANDBOX_CLEANUP_SESSION = "session"
 SANDBOX_CLEANUP_NEVER = "never"
+SANDBOX_REUSE_SKILL = "skill"
+SANDBOX_REUSE_STREAM = "stream"
 
 
 def _normalize_sandbox_cleanup_policy(policy: Any) -> str:
@@ -667,6 +673,38 @@ def _normalize_sandbox_cleanup_policy(policy: Any) -> str:
         return normalized
     logger.warning(f"未知 sandbox cleanup_policy: {policy!r}，使用 single_turn")
     return SANDBOX_CLEANUP_SINGLE_TURN
+
+
+def _normalize_sandbox_reuse_scope(scope: Any) -> str:
+    """Normalize configured session sandbox reuse scope."""
+    text = str(scope or "").strip().lower().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "": SANDBOX_REUSE_SKILL,
+        "skill": SANDBOX_REUSE_SKILL,
+        "per_skill": SANDBOX_REUSE_SKILL,
+        "skill_name": SANDBOX_REUSE_SKILL,
+        "技能": SANDBOX_REUSE_SKILL,
+        "stream": SANDBOX_REUSE_STREAM,
+        "stream_id": SANDBOX_REUSE_STREAM,
+        "chat": SANDBOX_REUSE_STREAM,
+        "conversation": SANDBOX_REUSE_STREAM,
+        "聊天": SANDBOX_REUSE_STREAM,
+        "聊天流": SANDBOX_REUSE_STREAM,
+    }
+    normalized = aliases.get(text)
+    if normalized:
+        return normalized
+    logger.warning(f"未知 sandbox reuse_scope: {scope!r}，使用 skill")
+    return SANDBOX_REUSE_SKILL
+
+
+def _sandbox_lease_key(stream_id: str, skill_name: str, reuse_scope: str) -> str:
+    normalized_stream_id = str(stream_id or "").strip()
+    if not normalized_stream_id:
+        return ""
+    if reuse_scope == SANDBOX_REUSE_STREAM:
+        return f"stream:{normalized_stream_id}"
+    return f"skill:{normalized_stream_id}:{skill_name}"
 
 
 def _sandbox_setup_message() -> str:
@@ -1161,25 +1199,65 @@ class SandboxLeaseStore:
     """Tracks sandbox ids that are intentionally kept beyond one skill call."""
 
     def __init__(self) -> None:
-        self._leases: Dict[str, str] = {}
+        self._leases: Dict[str, Dict[str, Any]] = {}
 
-    def get(self, key: str) -> str:
-        return self._leases.get(key, "")
+    def get(self, key: str, *, touch: bool = True) -> str:
+        lease = self._leases.get(key)
+        if not lease:
+            return ""
+        if touch:
+            lease["last_active"] = time.time()
+        return str(lease.get("sandbox_id") or "")
 
     def save(self, key: str, sandbox_id: str) -> None:
         if key and sandbox_id:
-            self._leases[key] = sandbox_id
+            self._leases[key] = {
+                "sandbox_id": sandbox_id,
+                "last_active": time.time(),
+            }
 
     def clear(self, key: str) -> None:
         self._leases.pop(key, None)
 
+    def clear_all(self) -> None:
+        self._leases.clear()
+
     def pop_many(self, keys: Iterable[str]) -> List[str]:
         sandbox_ids: List[str] = []
         for key in keys:
-            sandbox_id = self._leases.pop(key, "")
+            lease = self._leases.pop(key, None)
+            sandbox_id = str((lease or {}).get("sandbox_id") or "")
             if sandbox_id:
                 sandbox_ids.append(sandbox_id)
         return sandbox_ids
+
+    def cleanup_expired(self, ttl: int, skip_keys: Optional[Set[str]] = None) -> List[str]:
+        now = time.time()
+        skip = skip_keys or set()
+        expired = [
+            key
+            for key, lease in self._leases.items()
+            if key not in skip
+            if now - float(lease.get("last_active") or 0) > ttl
+        ]
+        return self.pop_many(expired)
+
+
+class SandboxLeaseLockStore:
+    """Serializes access to a reused sandbox lease."""
+
+    def __init__(self) -> None:
+        self._locks: Dict[str, asyncio.Lock] = {}
+
+    def get(self, key: str) -> asyncio.Lock:
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        return lock
+
+    def locked_keys(self) -> Set[str]:
+        return {key for key, lock in self._locks.items() if lock.locked()}
 
 
 async def _destroy_sandbox_id(cfg: SandboxConfig, sandbox_id: str, client: Optional[Any] = None) -> None:
@@ -1197,12 +1275,12 @@ async def _destroy_sandbox_id(cfg: SandboxConfig, sandbox_id: str, client: Optio
             await active_client.__aexit__(None, None, None)
 
 
-async def _destroy_sandbox_leases(
-    keys: Iterable[str],
+async def _destroy_expired_sandbox_leases(
+    ttl: int,
     cfg: SandboxConfig,
     client: Optional[Any] = None,
 ) -> None:
-    sandbox_ids = _sandbox_leases.pop_many(keys)
+    sandbox_ids = _sandbox_leases.cleanup_expired(ttl, skip_keys=_sandbox_lease_locks.locked_keys())
     for sandbox_id in sandbox_ids:
         try:
             await _destroy_sandbox_id(cfg, sandbox_id, client)
@@ -1213,6 +1291,7 @@ async def _destroy_sandbox_leases(
 # 全局会话存储实例
 _session_store = SessionStore()
 _sandbox_leases = SandboxLeaseStore()
+_sandbox_lease_locks = SandboxLeaseLockStore()
 
 def _clear_script_cache() -> None:
     """兼容旧调用；脚本不再在宿主机 import，因此无需缓存。"""
@@ -1465,7 +1544,12 @@ async def run_agent_loop(
     max_tokens = config.agent_max_context_tokens
     cap_cfg = config.capabilities
     sandbox_cleanup_policy = _normalize_sandbox_cleanup_policy(config.sandbox.cleanup_policy)
-    session_key = _session_store.key(stream_id, skill.name) if config.session_enabled and stream_id else ""
+    sandbox_reuse_scope = _normalize_sandbox_reuse_scope(config.sandbox.reuse_scope)
+    sandbox_lease_key = (
+        _sandbox_lease_key(stream_id, skill.name, sandbox_reuse_scope)
+        if config.session_enabled and stream_id
+        else ""
+    )
 
     allowed_caps = get_allowed_caps(skill, cap_cfg, grant_store)
     denied_caps = [c for c in skill.capabilities if c not in allowed_caps]
@@ -1523,9 +1607,9 @@ async def run_agent_loop(
     # 多轮会话：尝试恢复已有 session
     messages: List[Dict[str, Any]] = []
     if config.session_enabled and stream_id:
-        expired_keys = _session_store.cleanup_expired(config.session_ttl_seconds)
+        _session_store.cleanup_expired(config.session_ttl_seconds)
         if sandbox_cleanup_policy == SANDBOX_CLEANUP_SESSION:
-            await _destroy_sandbox_leases(expired_keys, config.sandbox, sandbox_client)
+            await _destroy_expired_sandbox_leases(config.session_ttl_seconds, config.sandbox, sandbox_client)
         existing = _session_store.get(stream_id, skill.name, config.session_ttl_seconds)
         if existing:
             # 延续已有会话，追加新的 user message
@@ -1544,10 +1628,18 @@ async def run_agent_loop(
     sandbox_cm: Optional[SandboxRuntime] = None
     sandbox: Optional[SandboxRuntime] = None
     sandbox_entered = False
+    sandbox_lease_lock: Optional[asyncio.Lock] = None
+    sandbox_lease_locked = False
+    persistent_session_sandbox = False
     try:
         if needs_sandbox:
-            persistent_session_sandbox = sandbox_cleanup_policy == SANDBOX_CLEANUP_SESSION and bool(session_key)
-            reusable_sandbox_id = _sandbox_leases.get(session_key) if persistent_session_sandbox else ""
+            persistent_session_sandbox = sandbox_cleanup_policy == SANDBOX_CLEANUP_SESSION and bool(sandbox_lease_key)
+            if persistent_session_sandbox:
+                sandbox_lease_lock = _sandbox_lease_locks.get(sandbox_lease_key)
+                await sandbox_lease_lock.acquire()
+                sandbox_lease_locked = True
+
+            reusable_sandbox_id = _sandbox_leases.get(sandbox_lease_key) if persistent_session_sandbox else ""
             destroy_on_exit = sandbox_cleanup_policy == SANDBOX_CLEANUP_SINGLE_TURN
             if sandbox_cleanup_policy == SANDBOX_CLEANUP_SESSION and not persistent_session_sandbox:
                 destroy_on_exit = True
@@ -1565,7 +1657,7 @@ async def run_agent_loop(
             sandbox_entered = True
             await sandbox.sync_skill(skill)
             if persistent_session_sandbox and sandbox.sandbox_id:
-                _sandbox_leases.save(session_key, sandbox.sandbox_id)
+                _sandbox_leases.save(sandbox_lease_key, sandbox.sandbox_id)
                 sandbox_cm.destroy_on_exit = False
 
         for turn in range(max_turns):
@@ -1642,6 +1734,10 @@ async def run_agent_loop(
                 await sandbox_cm.__aexit__(None, None, None)
             except Exception as e:
                 logger.warning(f"清理 sandbox 失败: {e}")
+        if persistent_session_sandbox and sandbox_lease_key and sandbox is not None and sandbox.sandbox_id:
+            _sandbox_leases.save(sandbox_lease_key, sandbox.sandbox_id)
+        if sandbox_lease_locked and sandbox_lease_lock is not None:
+            sandbox_lease_lock.release()
 
     # 保存多轮会话
     if config.session_enabled and stream_id:
@@ -1795,6 +1891,20 @@ class SkillLoaderPlugin(MaiBotPlugin):
             },
         })
 
+        components.append({
+            "name": "skill_loader_sandbox_janitor",
+            "type": "HOOK_HANDLER",
+            "metadata": {
+                "handler_name": "_handle_sandbox_janitor_hook",
+                "description": "入站消息时清理过期 session sandbox",
+                "hook": "chat.receive.before_process",
+                "mode": "observe",
+                "order": "late",
+                "timeout_ms": 30000,
+                "error_policy": "log",
+            },
+        })
+
         return components
 
     async def invoke_component(self, component_name: str, **kwargs) -> Any:
@@ -1804,6 +1914,19 @@ class SkillLoaderPlugin(MaiBotPlugin):
         elif component_name in self._skills:
             return await self._invoke_skill(component_name, **kwargs)
         return {"name": component_name, "content": f"未知组件: {component_name}"}
+
+    async def _handle_sandbox_janitor_hook(self, **kwargs) -> Dict[str, str]:
+        """Observe hook: opportunistically clean expired session sandboxes."""
+        if _normalize_sandbox_cleanup_policy(self.config.sandbox.cleanup_policy) != SANDBOX_CLEANUP_SESSION:
+            return {"action": "continue"}
+        try:
+            await _destroy_expired_sandbox_leases(
+                self.config.session_ttl_seconds,
+                self.config.sandbox,
+            )
+        except Exception as exc:
+            logger.warning(f"消息预处理清理过期 sandbox 失败: {exc}")
+        return {"action": "continue"}
 
     async def _get_chat_context(self, stream_id: str, limit: int = 10) -> str:
         """获取最近的聊天记录作为上下文。"""
